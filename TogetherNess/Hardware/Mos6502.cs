@@ -94,35 +94,14 @@ public class Mos6502
     {
     }
     
-    public byte CpuAdd(byte a, byte b)
+    public int CpuAdd(int a, int b, bool addCarryBit = false)
     {
-        // Signed add.
-        try
-        {
-            checked
-            {
-                var _ = ((sbyte)a) + ((sbyte)b);
-            }
-            OverflowBit = false;
-        }
-        catch (OverflowException)
-        {
-            OverflowBit = true;
-        }
-        // Unsigned add
-        byte result = 0;
-        try
-        {
-            checked
-            {
-                result = (byte)(a + b);
-            }
-            CarryBit = false;
-        }
-        catch (OverflowException)
-        {
-            CarryBit = true;
-        }
+        int result = a + b + (addCarryBit && CarryBit ? 1 : 0);
+        
+        CarryBit = result > 0xFF;
+        OverflowBit = ((result ^ a) & (result ^ b) & 0x80) != 0;
+        ZeroBit = result == 0;
+        NegativeBit = (result & 0x80) != 0; // Negative bit is the MSb.
         return result;
     }
 
@@ -197,10 +176,9 @@ public class Mos6502
             // ORA zeropage
             0x5 => CurrentInstructionStep switch
             {
-                1 => OraZeropageXCycle1(),
-                2 => OraZeropageXCycle2(),
-                3 => OraZeropageXCycle3(),
-                4 => OraZeropageXCycle4(),
+                1 => OraZeropageCycle1(),
+                2 => OraZeropageCycle2(),
+                3 => OraZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x5)
             },
             // ASL zeropage
@@ -376,10 +354,11 @@ public class Mos6502
             // 0x19 ORA absolute, Y
             0x19 => CurrentInstructionStep switch
             {
-                1 => OraAbsoluteCycle1(),
-                2 => OraAbsoluteCycle2(),
-                3 => OraAbsoluteCycle3(),
-                4 => OraAbsoluteCycle4(),
+                1 => OraAbsoluteYCycle1(),
+                2 => OraAbsoluteYCycle2(),
+                3 => OraAbsoluteYCycle3(),
+                4 => OraAbsoluteYCycle4(),
+                5 => OraAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x19)
             },       
             // 0x1A NOP implied (illegal)
@@ -459,12 +438,12 @@ public class Mos6502
             // 0x21 AND X, indirect
             0x21 => CurrentInstructionStep switch
             {
-                1 => AndIndirectYCycle1(),
-                2 => AndIndirectYCycle2(),
-                3 => AndIndirectYCycle3(),
-                4 => AndIndirectYCycle4(),
-                5 => AndIndirectYCycle5(),
-                6 => AndIndirectYCycle6(),
+                1 => AndIndirectXCycle1(),
+                2 => AndIndirectXCycle2(),
+                3 => AndIndirectXCycle3(),
+                4 => AndIndirectXCycle4(),
+                5 => AndIndirectXCycle5(),
+                6 => AndIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x21)
             },       
             // 0x22 JAM (illegal)
@@ -472,14 +451,14 @@ public class Mos6502
             // 0x23 RLA X, indirect
             0x23 => CurrentInstructionStep switch
             {
-                1 => RlaIndirectYCycle1(),
-                2 => RlaIndirectYCycle2(),
-                3 => RlaIndirectYCycle3(),
-                4 => RlaIndirectYCycle4(),
-                5 => RlaIndirectYCycle5(),
-                6 => RlaIndirectYCycle6(),
-                7 => RlaIndirectYCycle7(),
-                8 => RlaIndirectYCycle8(),
+                1 => RlaIndirectXCycle1(),
+                2 => RlaIndirectXCycle2(),
+                3 => RlaIndirectXCycle3(),
+                4 => RlaIndirectXCycle4(),
+                5 => RlaIndirectXCycle5(),
+                6 => RlaIndirectXCycle6(),
+                7 => RlaIndirectXCycle7(),
+                8 => RlaIndirectXCycle8(),
                 _ => throw new InvalidInstructionStepException(0x23)
             },       
             // 0x24 BIT zeropage
@@ -504,6 +483,8 @@ public class Mos6502
                 1 => RolZeropageCycle1(), 
                 2 => RolZeropageCycle2(),
                 3 => RolZeropageCycle3(),
+                4 => RolZeropageCycle4(),
+                5 => RolZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0x26)
             },       
             // 0x27 RLA zeropage (illegal)
@@ -519,9 +500,10 @@ public class Mos6502
             // 0x28 PHA
             0x28 => CurrentInstructionStep switch
             {
-                1 => PhaCycle1(), 
-                2 => PhaCycle2(), 
-                3 => PhaCycle3(), 
+                1 => PlpCycle1(), 
+                2 => PlpCycle2(), 
+                3 => PlpCycle3(), 
+                4 => PlpCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x28)
             },
             // 0x29 AND imd
@@ -633,29 +615,32 @@ public class Mos6502
             // 0x35 AND zeropage, X
             0x35 => CurrentInstructionStep switch
             {
-                1 => AndZeropageCycle1(), 
-                2 => AndZeropageCycle2(), 
-                3 => AndZeropageCycle3(), 
+                1 => AndZeropageXCycle1(), 
+                2 => AndZeropageXCycle2(), 
+                3 => AndZeropageXCycle3(), 
+                4 => AndZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x35)
             },
             // 0x36 ROL zeropage, X
             0x36 => CurrentInstructionStep switch
             {
-                1 => RolZeropageCycle1(), 
-                2 => RolZeropageCycle2(), 
-                3 => RolZeropageCycle3(), 
-                4 => RolZeropageCycle4(), 
-                5 => RolZeropageCycle5(), 
+                1 => RolZeropageXCycle1(), 
+                2 => RolZeropageXCycle2(), 
+                3 => RolZeropageXCycle3(), 
+                4 => RolZeropageXCycle4(), 
+                5 => RolZeropageXCycle5(), 
+                6 => RolZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x36)
             },
             // 0x37 RLA zeropage, X (illegal)
             0x37 => CurrentInstructionStep switch
             {
-                1 => RlaZeropageCycle1(), 
-                2 => RlaZeropageCycle2(), 
-                3 => RlaZeropageCycle3(), 
-                4 => RlaZeropageCycle4(), 
-                5 => RlaZeropageCycle5(), 
+                1 => RlaZeropageXCycle1(), 
+                2 => RlaZeropageXCycle2(), 
+                3 => RlaZeropageXCycle3(), 
+                4 => RlaZeropageXCycle4(), 
+                5 => RlaZeropageXCycle5(), 
+                6 => RlaZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x37)
             },
             // 0x38 SEC implied
@@ -849,14 +834,13 @@ public class Mos6502
                 4 => JmpAbsoluteCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x4C)
             },
-            // 0x4D EOR abs, X
+            // 0x4D EOR abs
             0x4D => CurrentInstructionStep switch
             {
-                1 => EorAbsoluteXCycle1(), 
-                2 => EorAbsoluteXCycle2(), 
-                3 => EorAbsoluteXCycle3(), 
-                4 => EorAbsoluteXCycle4(), 
-                5 => EorAbsoluteXCycle5(), 
+                1 => EorAbsoluteCycle1(), 
+                2 => EorAbsoluteCycle2(), 
+                3 => EorAbsoluteCycle3(), 
+                4 => EorAbsoluteCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x4D)
             },
             // 0x4E LSR abs
@@ -884,10 +868,10 @@ public class Mos6502
             // 0x50 BVC rel
             0x50 => CurrentInstructionStep switch
             {
-                1 => BccCycle1(), 
-                2 => BccCycle1(), 
-                3 => BccCycle1(), 
-                4 => BccCycle1(), 
+                1 => BvcCycle1(), 
+                2 => BvcCycle2(), 
+                3 => BvcCycle3(), 
+                4 => BvcCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x50)
             },
             // 0x51 BVC rel
@@ -948,13 +932,12 @@ public class Mos6502
             // 0x57 SRE zeropage, X
             0x57 => CurrentInstructionStep switch
             {
-                1 => SreAbsoluteXCycle1(), 
-                2 => SreAbsoluteXCycle2(), 
-                3 => SreAbsoluteXCycle3(), 
-                4 => SreAbsoluteXCycle4(), 
-                5 => SreAbsoluteXCycle5(), 
-                6 => SreAbsoluteXCycle6(), 
-                7 => SreAbsoluteXCycle7(), 
+                1 => SreZeropageXCycle1(), 
+                2 => SreZeropageXCycle2(), 
+                3 => SreZeropageXCycle3(), 
+                4 => SreZeropageXCycle4(), 
+                5 => SreZeropageXCycle5(), 
+                6 => SreZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x57)
             },
             // 0x58 CLI impl
@@ -990,6 +973,7 @@ public class Mos6502
                 4 => SreAbsoluteYCycle4(), 
                 5 => SreAbsoluteYCycle5(), 
                 6 => SreAbsoluteYCycle6(), 
+                7 => SreAbsoluteYCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x5B)
             },
             // 0x5C NOP abs, X
@@ -1115,6 +1099,8 @@ public class Mos6502
             {
                 1 => PlaCycle1(), 
                 2 => PlaCycle2(), 
+                3 => PlaCycle3(), 
+                4 => PlaCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x68)
             },
             // 0x69 ADC imm
@@ -1127,10 +1113,8 @@ public class Mos6502
             // 0x6A ROR abs
             0x6A => CurrentInstructionStep switch
             {
-                1 => AdcAbsoluteCycle1(), 
-                2 => AdcAbsoluteCycle2(), 
-                3 => AdcAbsoluteCycle3(), 
-                4 => AdcAbsoluteCycle4(), 
+                1 => RorAccumCycle1(), 
+                2 => RorAccumCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x6A)
             },
             // 0x6B Arr imm
@@ -1244,7 +1228,7 @@ public class Mos6502
                 6 => RorZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x76)
             },       
-            // 0x76 RRA zeropage, X
+            // 0x77 RRA zeropage, X
             0x77 => CurrentInstructionStep switch
             {
                 1 => RraZeropageXCycle1(),
@@ -1253,4365 +1237,5554 @@ public class Mos6502
                 4 => RraZeropageXCycle4(),
                 5 => RraZeropageXCycle5(),
                 6 => RraZeropageXCycle6(),
-                _ => throw new InvalidInstructionStepException(0x76)
+                _ => throw new InvalidInstructionStepException(0x77)
             },       
+            // 0x78 SEI impl
+            0x78 => CurrentInstructionStep switch
+            {
+                1 => SeiCycle1(),
+                2 => SeiCycle2(),
+                _ => throw new InvalidInstructionStepException(0x78)
+            },       
+            // 0x79 ADC abs, Y
+            0x79 => CurrentInstructionStep switch
+            {
+                1 => AdcAbsoluteYCycle1(),
+                2 => AdcAbsoluteYCycle2(),
+                3 => AdcAbsoluteYCycle3(),
+                4 => AdcAbsoluteYCycle4(),
+                5 => AdcAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0x79)
+            },       
+            // 0x7A NOP impl
+            0x7A => CurrentInstructionStep switch
+            {
+                1 => NopImpliedCycle1(),
+                2 => NopImpliedCycle2(),
+                _ => throw new InvalidInstructionStepException(0x7A)
+            },       
+            // 0x7B RRA abs, Y
+            0x7B => CurrentInstructionStep switch
+            {
+                1 => RraAbsoluteYCycle1(),
+                2 => RraAbsoluteYCycle2(),
+                3 => RraAbsoluteYCycle3(),
+                4 => RraAbsoluteYCycle4(),
+                5 => RraAbsoluteYCycle5(),
+                6 => RraAbsoluteYCycle6(),
+                7 => RraAbsoluteYCycle7(),
+                _ => throw new InvalidInstructionStepException(0x7B)
+            },       
+            // 0x7C NOP abs, X
+            0x7C => CurrentInstructionStep switch
+            {
+                1 => NopAbsoluteXCycle1(),
+                2 => NopAbsoluteXCycle2(),
+                3 => NopAbsoluteXCycle3(),
+                4 => NopAbsoluteXCycle4(),
+                5 => NopAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0x7C)
+            },       
+            // 0x7D ADC abs, X
+            0x7D => CurrentInstructionStep switch
+            {
+                1 => AdcAbsoluteXCycle1(),
+                2 => AdcAbsoluteXCycle2(),
+                3 => AdcAbsoluteXCycle3(),
+                4 => AdcAbsoluteXCycle4(),
+                5 => AdcAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0x7D)
+            },       
+            // 0x7E ROR abs, X
+            0x7E => CurrentInstructionStep switch
+            {
+                1 => RorAbsoluteXCycle1(),
+                2 => RorAbsoluteXCycle2(),
+                3 => RorAbsoluteXCycle3(),
+                4 => RorAbsoluteXCycle4(),
+                5 => RorAbsoluteXCycle5(),
+                6 => RorAbsoluteXCycle6(),
+                7 => RorAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0x7E)
+            },       
+            // 0x7F RRA abs, X
+            0x7F => CurrentInstructionStep switch
+            {
+                1 => RraAbsoluteXCycle1(),
+                2 => RraAbsoluteXCycle2(),
+                3 => RraAbsoluteXCycle3(),
+                4 => RraAbsoluteXCycle4(),
+                5 => RraAbsoluteXCycle5(),
+                6 => RraAbsoluteXCycle6(),
+                7 => RraAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0x7F)
+            },       
+            // 0x80 NOP imm
+            0x80 => CurrentInstructionStep switch
+            {
+                1 => NopImmCycle1(),
+                2 => NopImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0x80)
+            },       
+            // 0x81 STA X, ind
+            0x81 => CurrentInstructionStep switch
+            {
+                1 => StaIndirectXCycle1(),
+                2 => StaIndirectXCycle2(),
+                3 => StaIndirectXCycle3(),
+                4 => StaIndirectXCycle4(),
+                5 => StaIndirectXCycle5(),
+                6 => StaIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0x81)
+            },       
+            // 0x82 NOP imm
+            0x82 => CurrentInstructionStep switch
+            {
+                1 => NopImmCycle1(),
+                2 => NopImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0x82)
+            },       
+            // 0x83 SAX x, ind
+            0x83 => CurrentInstructionStep switch
+            {
+                1 => SaxIndirectXCycle1(),
+                2 => SaxIndirectXCycle2(),
+                3 => SaxIndirectXCycle3(),
+                4 => SaxIndirectXCycle4(),
+                5 => SaxIndirectXCycle5(),
+                6 => SaxIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0x83)
+            },       
+            // 0x84 STY zpg
+            0x84 => CurrentInstructionStep switch
+            {
+                1 => StyZeropageCycle1(),
+                2 => StyZeropageCycle2(),
+                3 => StyZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0x84)
+            },       
+            // 0x85 STA zpg
+            0x85 => CurrentInstructionStep switch
+            {
+                1 => StaZeropageCycle1(),
+                2 => StaZeropageCycle2(),
+                3 => StaZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0x85)
+            },       
+            // 0x86 STX zpg
+            0x86 => CurrentInstructionStep switch
+            {
+                1 => StxZeropageCycle1(),
+                2 => StxZeropageCycle2(),
+                3 => StxZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0x86)
+            },       
+            // 0x87 SAX zpg
+            0x87 => CurrentInstructionStep switch
+            {
+                1 => SaxZeropageCycle1(),
+                2 => SaxZeropageCycle2(),
+                3 => SaxZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0x87)
+            },       
+            // 0x88 DEY impl
+            0x88 => CurrentInstructionStep switch
+            {
+                1 => DeyCycle1(),
+                2 => DeyCycle2(),
+                _ => throw new InvalidInstructionStepException(0x88)
+            },       
+            // 0x89 DEY impl
+            0x89 => CurrentInstructionStep switch
+            {
+                1 => NopImmCycle1(),
+                2 => NopImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0x89)
+            },       
+            // 0x8A TXA impl
+            0x8A => CurrentInstructionStep switch
+            {
+                1 => TxaCycle1(),
+                2 => TxaCycle2(),
+                _ => throw new InvalidInstructionStepException(0x8A)
+            },       
+            // 0x8B ANE impl
+            0x8B => CurrentInstructionStep switch
+            {
+                1 => AneCycle1(),
+                2 => AneCycle2(),
+                _ => throw new InvalidInstructionStepException(0x8B)
+            },       
+            // 0x8C STY abs
+            0x8C => CurrentInstructionStep switch
+            {
+                1 => StyAbsoluteCycle1(),
+                2 => StyAbsoluteCycle2(),
+                3 => StyAbsoluteCycle3(),
+                4 => StyAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0x8C)
+            },       
+            // 0x8D STA abs
+            0x8D => CurrentInstructionStep switch
+            {
+                1 => StaAbsoluteCycle1(),
+                2 => StaAbsoluteCycle2(),
+                3 => StaAbsoluteCycle3(),
+                4 => StaAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0x8D)
+            },       
+            // 0x8E STX abs
+            0x8E => CurrentInstructionStep switch
+            {
+                1 => StxAbsoluteCycle1(),
+                2 => StxAbsoluteCycle2(),
+                3 => StxAbsoluteCycle3(),
+                4 => StxAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0x8E)
+            },       
+            // 0x8F STA abs
+            0x8F => CurrentInstructionStep switch
+            {
+                1 => SaxAbsoluteCycle1(),
+                2 => SaxAbsoluteCycle2(),
+                3 => SaxAbsoluteCycle3(),
+                4 => SaxAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0x8F)
+            },       
+            // 0x90 BCC rel
+            0x90 => CurrentInstructionStep switch
+            {
+                1 => BccCycle1(),
+                2 => BccCycle2(),
+                3 => BccCycle3(),
+                4 => BccCycle4(),
+                _ => throw new InvalidInstructionStepException(0x90)
+            },       
+            // 0x91 STA ind, Y
+            0x91 => CurrentInstructionStep switch
+            {
+                1 => StaIndirectYCycle1(),
+                2 => StaIndirectYCycle2(),
+                3 => StaIndirectYCycle3(),
+                4 => StaIndirectYCycle4(),
+                5 => StaIndirectYCycle5(),
+                6 => StaIndirectYCycle6(),
+                _ => throw new InvalidInstructionStepException(0x91)
+            },       
+            // 0x92 Sta ind, Y
+            0x92 => Jam(),
+            // 0x93 SHA ind, Y
+            0x93 => CurrentInstructionStep switch
+            {
+                1 => ShaIndirectYCycle1(),
+                2 => ShaIndirectYCycle2(),
+                3 => ShaIndirectYCycle3(),
+                4 => ShaIndirectYCycle4(),
+                5 => ShaIndirectYCycle5(),
+                _ => throw new InvalidInstructionStepException(0x93)
+            },       
+            // 0x94 STY zpg, X
+            0x94 => CurrentInstructionStep switch
+            {
+                1 => StyZeropageXCycle1(),
+                2 => StyZeropageXCycle2(),
+                3 => StyZeropageXCycle3(),
+                4 => StyZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0x94)
+            },       
+            // 0x95 STA zpg, X
+            0x95 => CurrentInstructionStep switch
+            {
+                1 => StaZeropageXCycle1(),
+                2 => StaZeropageXCycle2(),
+                3 => StaZeropageXCycle3(),
+                4 => StaZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0x95)
+            },       
+            // 0x96 STX zpg, X
+            0x96 => CurrentInstructionStep switch
+            {
+                1 => StxZeropageYCycle1(),
+                2 => StxZeropageYCycle2(),
+                3 => StxZeropageYCycle3(), 
+                4 => StxZeropageYCycle4(),
+                _ => throw new InvalidInstructionStepException(0x96)
+            },       
+            // 0x97 SAX zpg, Y
+            0x97 => CurrentInstructionStep switch
+            {
+                1 => SaxZeropageYCycle1(),
+                2 => SaxZeropageYCycle2(),
+                3 => SaxZeropageYCycle3(),
+                4 => SaxZeropageYCycle4(),
+                5 => SaxZeropageYCycle5(),
+                6 => SaxZeropageYCycle6(),
+                _ => throw new InvalidInstructionStepException(0x97)
+            },       
+            // 0x98 TYA impl
+            0x98 => CurrentInstructionStep switch
+            {
+                1 => TyaCycle1(),
+                2 => TyaCycle2(),
+                _ => throw new InvalidInstructionStepException(0x98)
+            },       
+            // 0x99 STA abs, Y
+            0x99 => CurrentInstructionStep switch
+            {
+                1 => StaAbsoluteYCycle1(),
+                2 => StaAbsoluteYCycle2(),
+                3 => StaAbsoluteYCycle3(),
+                4 => StaAbsoluteYCycle4(),
+                5 => StaAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0x99)
+            },       
+            // 0x9A TXS impl
+            0x9A => CurrentInstructionStep switch
+            {
+                1 => TxsCycle1(),
+                2 => TxsCycle2(),
+                _ => throw new InvalidInstructionStepException(0x9A)
+            },       
+            // 0x9B TAS abs, Y
+            0x9B => CurrentInstructionStep switch
+            {
+                1 => TasCycle1(),
+                2 => TasCycle2(),
+                3 => TasCycle3(),
+                4 => TasCycle4(),
+                5 => TasCycle5(),
+                _ => throw new InvalidInstructionStepException(0x9B)
+            },       
+            // 0x9C SHY abs, X
+            0x9C => CurrentInstructionStep switch
+            {
+                1 => ShyCycle1(),
+                2 => ShyCycle2(),
+                3 => ShyCycle3(),
+                4 => ShyCycle4(),
+                5 => ShyCycle5(),
+                _ => throw new InvalidInstructionStepException(0x9C)
+            },       
+            // 0x9D STA abs, X
+            0x9D => CurrentInstructionStep switch
+            {
+                1 => StaAbsoluteXCycle1(),
+                2 => StaAbsoluteXCycle2(),
+                3 => StaAbsoluteXCycle3(),
+                4 => StaAbsoluteXCycle4(),
+                5 => StaAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0x9D)
+            },       
+            // 0x9E SHX abs, Y
+            0x9E => CurrentInstructionStep switch
+            {
+                1 => ShxCycle1(),
+                2 => ShxCycle2(),
+                3 => ShxCycle3(),
+                4 => ShxCycle4(),
+                5 => ShxCycle5(),
+                _ => throw new InvalidInstructionStepException(0x9E)
+            },       
+            // 0x9F SHX abs, Y
+            0x9F => CurrentInstructionStep switch
+            {
+                1 => ShaAbsoluteYCycle1(),
+                2 => ShaAbsoluteYCycle2(),
+                3 => ShaAbsoluteYCycle3(),
+                4 => ShaAbsoluteYCycle4(),
+                5 => ShaAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0x9F)
+            },       
+            // 0xA0 LDY imm
+            0xA0 => CurrentInstructionStep switch
+            {
+                1 => LdyImmCycle1(),
+                2 => LdyImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xA0)
+            },       
+            // 0xA1 LDA X, ind
+            0xA1 => CurrentInstructionStep switch
+            {
+                1 => LdaIndirectXCycle1(),
+                2 => LdaIndirectXCycle2(),
+                3 => LdaIndirectXCycle3(),
+                4 => LdaIndirectXCycle4(),
+                5 => LdaIndirectXCycle5(),
+                6 => LdaIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xA1)
+            },       
+            // 0xA2 LDX imm
+            0xA2 => CurrentInstructionStep switch
+            {
+                1 => LdxImmCycle1(),
+                2 => LdxImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xA2)
+            },       
+            // 0xA3 LAX X, ind
+            0xA3 => CurrentInstructionStep switch
+            {
+                1 => LaxIndirectXCycle1(),
+                2 => LaxIndirectXCycle2(),
+                3 => LaxIndirectXCycle3(),
+                4 => LaxIndirectXCycle4(),
+                5 => LaxIndirectXCycle5(),
+                6 => LaxIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xA3)
+            },       
+            // 0xA4 LDY zpg
+            0xA4 => CurrentInstructionStep switch
+            {
+                1 => LdyZeropageCycle1(),
+                2 => LdyZeropageCycle2(),
+                3 => LdyZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xA4)
+            },       
+            // 0xA5 LDA zpg
+            0xA5 => CurrentInstructionStep switch
+            {
+                1 => LdaZeropageCycle1(),
+                2 => LdaZeropageCycle2(),
+                3 => LdaZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xA5)
+            },       
+            // 0xA6 LDX zpg
+            0xA6 => CurrentInstructionStep switch
+            {
+                1 => LdxZeropageCycle1(),
+                2 => LdxZeropageCycle2(),
+                3 => LdxZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xA6)
+            },       
+            // 0xA7 LAX zpg
+            0xA7 => CurrentInstructionStep switch
+            {
+                1 => LaxZeropageCycle1(),
+                2 => LaxZeropageCycle2(),
+                3 => LaxZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xA7)
+            },       
+            // 0xA8 TAY impl
+            0xA8 => CurrentInstructionStep switch
+            {
+                1 => TayCycle1(),
+                2 => TayCycle2(),
+                _ => throw new InvalidInstructionStepException(0xA8)
+            },       
+            // 0xA9 LDA imm
+            0xA9 => CurrentInstructionStep switch
+            {
+                1 => LdaImmCycle1(),
+                2 => LdaImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xA9)
+            },       
+            // 0xAA TAX impl
+            0xAA => CurrentInstructionStep switch
+            {
+                1 => TaxCycle1(),
+                2 => TaxCycle2(),
+                _ => throw new InvalidInstructionStepException(0xAA)
+            },       
+            // 0xAB LXA imm
+            0xAB => CurrentInstructionStep switch
+            {
+                1 => LxaCycle1(),
+                2 => LxaCycle2(),
+                _ => throw new InvalidInstructionStepException(0xAB)
+            },       
+            // 0xAC LDY abs
+            0xAC => CurrentInstructionStep switch
+            {
+                1 => LdyAbsoluteCycle1(),
+                2 => LdyAbsoluteCycle2(),
+                3 => LdyAbsoluteCycle3(),
+                4 => LdyAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xAC)
+            },       
+            // 0xAD LDA abs
+            0xAD => CurrentInstructionStep switch
+            {
+                1 => LdaAbsoluteCycle1(),
+                2 => LdaAbsoluteCycle2(),
+                3 => LdaAbsoluteCycle3(),
+                4 => LdaAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xAD)
+            },       
+            // 0xAE LDX abs
+            0xAE => CurrentInstructionStep switch
+            {
+                1 => LdxAbsoluteCycle1(),
+                2 => LdxAbsoluteCycle2(),
+                3 => LdxAbsoluteCycle3(),
+                4 => LdxAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xAE)
+            },       
+            // 0xAF LAX abs
+            0xAF => CurrentInstructionStep switch
+            {
+                1 => LaxAbsoluteCycle1(),
+                2 => LaxAbsoluteCycle2(),
+                3 => LaxAbsoluteCycle3(),
+                4 => LaxAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xAF)
+            },       
+            // 0xB0 BCS rel
+            0xB0 => CurrentInstructionStep switch
+            {
+                1 => BcsCycle1(),
+                2 => BcsCycle2(),
+                3 => BcsCycle3(),
+                4 => BcsCycle4(),
+                _ => throw new InvalidInstructionStepException(0xB0)
+            },       
+            // 0xB1 LDA ind, Y
+            0xB1 => CurrentInstructionStep switch
+            {
+                1 => LdaIndirectYCycle1(),
+                2 => LdaIndirectYCycle2(),
+                3 => LdaIndirectYCycle3(),
+                4 => LdaIndirectYCycle4(),
+                5 => LdaIndirectYCycle5(),
+                6 => LdaIndirectYCycle6(),
+                _ => throw new InvalidInstructionStepException(0xB1)
+            },       
+            // 0xB2 Jam
+            0xB2 => Jam(),
+            // 0xB3 LAX ind, Y
+            0xB3 => CurrentInstructionStep switch
+            {
+                1 => LaxIndirectYCycle1(),
+                2 => LaxIndirectYCycle2(),
+                3 => LaxIndirectYCycle3(),
+                4 => LaxIndirectYCycle4(),
+                5 => LaxIndirectYCycle5(),
+                6 => LaxIndirectYCycle6(),
+                _ => throw new InvalidInstructionStepException(0xB3)
+            },       
+            // 0xB4 LDY zpg, X
+            0xB4 => CurrentInstructionStep switch
+            {
+                1 => LdyZeropageXCycle1(),
+                2 => LdyZeropageXCycle2(),
+                3 => LdyZeropageXCycle3(),
+                4 => LdyZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xB4)
+            },       
+            // 0xB5 LDA zpg, X
+            0xB5 => CurrentInstructionStep switch
+            {
+                1 => LdaZeropageXCycle1(),
+                2 => LdaZeropageXCycle2(),
+                3 => LdaZeropageXCycle3(),
+                4 => LdaZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xB5)
+            },       
+            // 0xB6 LDX zpg, Y
+            0xB6 => CurrentInstructionStep switch
+            {
+                1 => LdxZeropageYCycle1(),
+                2 => LdxZeropageYCycle2(),
+                3 => LdxZeropageYCycle3(),
+                4 => LdxZeropageYCycle4(),
+                _ => throw new InvalidInstructionStepException(0xB6)
+            },       
+            // 0xB7 LAX zpg, X
+            0xB7 => CurrentInstructionStep switch
+            {
+                1 => LaxZeropageYCycle1(),
+                2 => LaxZeropageYCycle2(),
+                3 => LaxZeropageYCycle3(),
+                4 => LaxZeropageYCycle4(),
+                _ => throw new InvalidInstructionStepException(0xB7)
+            },       
+            // 0xB8 CLV impl
+            0xB8 => CurrentInstructionStep switch
+            {
+                1 => ClvCycle1(),
+                2 => ClvCycle2(),
+                _ => throw new InvalidInstructionStepException(0xB8)
+            },       
+            // 0xB9 LDA abs, Y
+            0xB9 => CurrentInstructionStep switch
+            {
+                1 => LdaAbsoluteYCycle1(),
+                2 => LdaAbsoluteYCycle2(),
+                3 => LdaAbsoluteYCycle3(),
+                4 => LdaAbsoluteYCycle4(),
+                5 => LdaAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0xB9)
+            },       
+            // 0xBA TSX impl
+            0xBA => CurrentInstructionStep switch
+            {
+                1 => TsxCycle1(),
+                2 => TsxCycle2(),
+                _ => throw new InvalidInstructionStepException(0xBA)
+            },       
+            // 0xBB LAS abs, Y
+            0xBB => CurrentInstructionStep switch
+            {
+                1 => LasCycle1(),
+                2 => LasCycle2(),
+                3 => LasCycle3(),
+                4 => LasCycle4(),
+                _ => throw new InvalidInstructionStepException(0xBB)
+            },       
+            // 0xBC LDY abs, X
+            0xBC => CurrentInstructionStep switch
+            {
+                1 => LdyAbsoluteXCycle1(),
+                2 => LdyAbsoluteXCycle2(),
+                3 => LdyAbsoluteXCycle3(),
+                4 => LdyAbsoluteXCycle4(),
+                5 => LdyAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xBC)
+            },       
+            // 0xBD LDA abs, X
+            0xBD => CurrentInstructionStep switch
+            {
+                1 => LdaAbsoluteXCycle1(),
+                2 => LdaAbsoluteXCycle2(),
+                3 => LdaAbsoluteXCycle3(),
+                4 => LdaAbsoluteXCycle4(),
+                5 => LdaAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xBD)
+            },       
+            // 0xBE LDX abs, Y
+            0xBE => CurrentInstructionStep switch
+            {
+                1 => LdxAbsoluteYCycle1(),
+                2 => LdxAbsoluteYCycle2(),
+                3 => LdxAbsoluteYCycle3(),
+                4 => LdxAbsoluteYCycle4(),
+                5 => LdxAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0xBE)
+            },       
+            // 0xBF LAX abs, Y
+            0xBF => CurrentInstructionStep switch
+            {
+                1 => LaxAbsoluteYCycle1(),
+                2 => LaxAbsoluteYCycle2(),
+                3 => LaxAbsoluteYCycle3(),
+                4 => LaxAbsoluteYCycle4(),
+                5 => LaxAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0xBF)
+            },       
+            // 0xC0 CPY imm
+            0xC0 => CurrentInstructionStep switch
+            {
+                1 => CpyImmCycle1(),
+                2 => CpyImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xC0)
+            },       
+            // 0xC1 CMP X, ind
+            0xC1 => CurrentInstructionStep switch
+            {
+                1 => CmpIndirectXCycle1(),
+                2 => CmpIndirectXCycle2(),
+                3 => CmpIndirectXCycle3(),
+                4 => CmpIndirectXCycle4(),
+                5 => CmpIndirectXCycle5(),
+                6 => CmpIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xC1)
+            },       
+            // 0xC2 NOP
+            0xC2 => Jam(),
+            // 0xC3 DCP X, ind
+            0xC3 => CurrentInstructionStep switch
+            {
+                1 => DcpIndirectXCycle1(),
+                2 => DcpIndirectXCycle2(),
+                3 => DcpIndirectXCycle3(),
+                4 => DcpIndirectXCycle4(),
+                5 => DcpIndirectXCycle5(),
+                6 => DcpIndirectXCycle6(),
+                7 => DcpIndirectXCycle7(),
+                8 => DcpIndirectXCycle8(),
+                _ => throw new InvalidInstructionStepException(0xC3)
+            },       
+            // 0xC4 CPY zpg
+            0xC4 => CurrentInstructionStep switch
+            {
+                1 => CpyZeropageCycle1(),
+                2 => CpyZeropageCycle2(),
+                3 => CpyZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xC4)
+            },       
+            // 0xC5 CMP zpg
+            0xC5 => CurrentInstructionStep switch
+            {
+                1 => CmpZeropageCycle1(),
+                2 => CmpZeropageCycle2(),
+                3 => CmpZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xC5)
+            },       
+            // 0xC6 DEC zpg
+            0xC6 => CurrentInstructionStep switch
+            {
+                1 => DecZeropageCycle1(),
+                2 => DecZeropageCycle2(),
+                3 => DecZeropageCycle3(),
+                4 => DecZeropageCycle4(),
+                5 => DecZeropageCycle5(),
+                _ => throw new InvalidInstructionStepException(0xC6)
+            },       
+            // 0xC7 DCP zpg
+            0xC7 => CurrentInstructionStep switch
+            {
+                1 => DcpZeropageCycle1(),
+                2 => DcpZeropageCycle2(),
+                3 => DcpZeropageCycle3(),
+                4 => DcpZeropageCycle4(),
+                5 => DcpZeropageCycle5(),
+                _ => throw new InvalidInstructionStepException(0xC7)
+            },       
+            // 0xC8 INY impl
+            0xC8 => CurrentInstructionStep switch
+            {
+                1 => InyCycle1(),
+                2 => InyCycle2(),
+                _ => throw new InvalidInstructionStepException(0xC8)
+            },       
+            // 0xC9 CMP imm
+            0xC9 => CurrentInstructionStep switch
+            {
+                1 => CmpImmCycle1(),
+                2 => CmpImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xC9)
+            },       
+            // 0xCA DEX impl
+            0xCA => CurrentInstructionStep switch
+            {
+                1 => DexCycle1(),
+                2 => DexCycle2(),
+                _ => throw new InvalidInstructionStepException(0xCA)
+            },       
+            // 0xCB SBX imm
+            0xCB => CurrentInstructionStep switch
+            {
+                1 => SbxCycle1(),
+                2 => SbxCycle2(),
+                _ => throw new InvalidInstructionStepException(0xCB)
+            },       
+            // 0xCC CPY abs
+            0xCC => CurrentInstructionStep switch
+            {
+                1 => CpyAbsoluteCycle1(),
+                2 => CpyAbsoluteCycle2(),
+                3 => CpyAbsoluteCycle3(),
+                4 => CpyAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xCC)
+            },       
+            // 0xCD CMP abs
+            0xCD => CurrentInstructionStep switch
+            {
+                1 => CmpAbsoluteCycle1(),
+                2 => CmpAbsoluteCycle2(),
+                3 => CmpAbsoluteCycle3(),
+                4 => CmpAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xCD)
+            },       
+            // 0xCE DEC abs
+            0xCE => CurrentInstructionStep switch
+            {
+                1 => DecAbsoluteCycle1(),
+                2 => DecAbsoluteCycle2(),
+                3 => DecAbsoluteCycle3(),
+                4 => DecAbsoluteCycle4(),
+                5 => DecAbsoluteCycle5(),
+                6 => DecAbsoluteCycle6(),
+                _ => throw new InvalidInstructionStepException(0xCE)
+            },       
+            // 0xCF DCP abs
+            0xCF => CurrentInstructionStep switch
+            {
+                1 => DcpAbsoluteCycle1(),
+                2 => DcpAbsoluteCycle2(),
+                3 => DcpAbsoluteCycle3(),
+                4 => DcpAbsoluteCycle4(),
+                5 => DcpAbsoluteCycle5(),
+                6 => DcpAbsoluteCycle6(),
+                _ => throw new InvalidInstructionStepException(0xCF)
+            },       
+            // 0xD0 BNE rel
+            0xD0 => CurrentInstructionStep switch
+            {
+                1 => BneCycle1(),
+                2 => BneCycle2(),
+                3 => BneCycle3(),
+                4 => BneCycle4(),
+                _ => throw new InvalidInstructionStepException(0xD0)
+            },       
+            // 0xD1 CMP ind, Y
+            0xD1 => CurrentInstructionStep switch
+            {
+                1 => CmpIndirectYCycle1(),
+                2 => CmpIndirectYCycle2(),
+                3 => CmpIndirectYCycle3(),
+                4 => CmpIndirectYCycle4(),
+                5 => CmpIndirectYCycle5(),
+                6 => CmpIndirectYCycle6(),
+                _ => throw new InvalidInstructionStepException(0xD1)
+            },       
+            // 0xD2 Jam
+            0xD2 => Jam(),
+            // 0xD3 DCP ind, Y
+            0xD3 => CurrentInstructionStep switch
+            {
+                1 => DcpIndirectYCycle1(),
+                2 => DcpIndirectYCycle2(),
+                3 => DcpIndirectYCycle3(),
+                4 => DcpIndirectYCycle4(),
+                5 => DcpIndirectYCycle5(),
+                6 => DcpIndirectYCycle6(),
+                7 => DcpIndirectYCycle7(),
+                8 => DcpIndirectYCycle8(),
+                _ => throw new InvalidInstructionStepException(0xD3)
+            },       
+            // 0xD4 NOP zpg, X
+            0xD4 => CurrentInstructionStep switch
+            {
+                1 => NopZeropageXCycle1(),
+                2 => NopZeropageXCycle2(),
+                3 => NopZeropageXCycle3(),
+                4 => NopZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xD4)
+            },       
+            // 0xD5 CMP zpg, X
+            0xD5 => CurrentInstructionStep switch
+            {
+                1 => CmpZeropageXCycle1(),
+                2 => CmpZeropageXCycle2(),
+                3 => CmpZeropageXCycle3(),
+                4 => CmpZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xD5)
+            },       
+            // 0xD6 DEC zpg, X
+            0xD6 => CurrentInstructionStep switch
+            {
+                1 => DecZeropageXCycle1(),
+                2 => DecZeropageXCycle2(),
+                3 => DecZeropageXCycle3(),
+                4 => DecZeropageXCycle4(),
+                5 => DecZeropageXCycle5(),
+                6 => DecZeropageXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xD6)
+            },       
+            // 0xD7 DCP zpg, X
+            0xD7 => CurrentInstructionStep switch
+            {
+                1 => DcpZeropageXCycle1(),
+                2 => DcpZeropageXCycle2(),
+                3 => DcpZeropageXCycle3(),
+                4 => DcpZeropageXCycle4(),
+                5 => DcpZeropageXCycle5(),
+                6 => DcpZeropageXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xD7)
+            },       
+            // 0xD8 CLD impl
+            0xD8 => CurrentInstructionStep switch
+            {
+                1 => CldCycle1(),
+                2 => CldCycle2(),
+                _ => throw new InvalidInstructionStepException(0xD8)
+            },       
+            // 0xD9 CMP abs, Y
+            0xD9 => CurrentInstructionStep switch
+            {
+                1 => CmpAbsoluteYCycle1(),
+                2 => CmpAbsoluteYCycle2(),
+                3 => CmpAbsoluteYCycle3(),
+                4 => CmpAbsoluteYCycle4(),
+                5 => CmpAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0xD9)
+            },       
+            // 0xDA NOP impl
+            0xDA => CurrentInstructionStep switch
+            {
+                1 => NopImpliedCycle1(),
+                2 => NopImpliedCycle2(),
+                _ => throw new InvalidInstructionStepException(0xDA)
+            },       
+            // 0xDB DCP abs, Y
+            0xDB => CurrentInstructionStep switch
+            {
+                1 => DcpAbsoluteYCycle1(),
+                2 => DcpAbsoluteYCycle2(),
+                3 => DcpAbsoluteYCycle3(),
+                4 => DcpAbsoluteYCycle4(),
+                5 => DcpAbsoluteYCycle5(),
+                6 => DcpAbsoluteYCycle6(),
+                7 => DcpAbsoluteYCycle7(),
+                _ => throw new InvalidInstructionStepException(0xDB)
+            },       
+            // 0xDC NOP abs, X
+            0xDC => CurrentInstructionStep switch
+            {
+                1 => NopAbsoluteXCycle1(),
+                2 => NopAbsoluteXCycle2(),
+                3 => NopAbsoluteXCycle3(),
+                4 => NopAbsoluteXCycle4(),
+                5 => NopAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xDC)
+            },       
+            // 0xDD CMP abs, X
+            0xDD => CurrentInstructionStep switch
+            {
+                1 => CmpAbsoluteXCycle1(),
+                2 => CmpAbsoluteXCycle2(),
+                3 => CmpAbsoluteXCycle3(),
+                4 => CmpAbsoluteXCycle4(),
+                5 => CmpAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xDD)
+            },
+            // 0xDE DEC abs, X
+            0xDE => CurrentInstructionStep switch
+            {
+                1 => DecAbsoluteXCycle1(),
+                2 => DecAbsoluteXCycle2(),
+                3 => DecAbsoluteXCycle3(),
+                4 => DecAbsoluteXCycle4(),
+                5 => DecAbsoluteXCycle5(),
+                6 => DecAbsoluteXCycle6(),
+                7 => DecAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0xDE)
+            },
+            // 0xDF DCP abs, X
+            0xDF => CurrentInstructionStep switch
+            {
+                1 => DcpAbsoluteXCycle1(),
+                2 => DcpAbsoluteXCycle2(),
+                3 => DcpAbsoluteXCycle3(),
+                4 => DcpAbsoluteXCycle4(),
+                5 => DcpAbsoluteXCycle5(),
+                6 => DcpAbsoluteXCycle6(),
+                7 => DcpAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0xDF)
+            },
+            // 0xE0 CPX imm
+            0xE0 => CurrentInstructionStep switch
+            {
+                1 => CpxImmCycle1(),
+                2 => CpxImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xE0)
+            },
+            // 0xE1 SBC X, ind
+            0xE1 => CurrentInstructionStep switch
+            {
+                1 => SbcIndirectXCycle1(),
+                2 => SbcIndirectXCycle2(),
+                3 => SbcIndirectXCycle3(),
+                4 => SbcIndirectXCycle4(),
+                5 => SbcIndirectXCycle5(),
+                6 => SbcIndirectXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xE1)
+            },
+            // 0xE2 NOP imm
+            0xE2 => CurrentInstructionStep switch
+            {
+                1 => NopImmCycle1(),
+                2 => NopImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xE2)
+            },
+            // 0xE3 ISC x, ind
+            0xE3 => CurrentInstructionStep switch
+            {
+                1 => IscIndirectXCycle1(),
+                2 => IscIndirectXCycle2(),
+                3 => IscIndirectXCycle3(),
+                4 => IscIndirectXCycle4(),
+                5 => IscIndirectXCycle5(),
+                6 => IscIndirectXCycle6(),
+                7 => IscIndirectXCycle7(),
+                8 => IscIndirectXCycle8(),
+                _ => throw new InvalidInstructionStepException(0xE3)
+            },
+            // 0xE4 CPX zpg
+            0xE4 => CurrentInstructionStep switch
+            {
+                1 => CpxZeropageCycle1(),
+                2 => CpxZeropageCycle2(),
+                3 => CpxZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xE4)
+            },
+            // 0xE5 SBC zpg
+            0xE5 => CurrentInstructionStep switch
+            {
+                1 => SbcZeropageCycle1(),
+                2 => SbcZeropageCycle2(),
+                3 => SbcZeropageCycle3(),
+                _ => throw new InvalidInstructionStepException(0xE5)
+            },
+            // 0xE6 INC zpg
+            0xE6 => CurrentInstructionStep switch
+            {
+                1 => IncZeropageCycle1(),
+                2 => IncZeropageCycle2(),
+                3 => IncZeropageCycle3(),
+                4 => IncZeropageCycle4(),
+                5 => IncZeropageCycle5(),
+                _ => throw new InvalidInstructionStepException(0xE6)
+            },
+            // 0xE7 ISC zpg
+            0xE7 => CurrentInstructionStep switch
+            {
+                1 => IscZeropageCycle1(),
+                2 => IscZeropageCycle2(),
+                3 => IscZeropageCycle3(),
+                4 => IscZeropageCycle4(),
+                5 => IscZeropageCycle5(),
+                _ => throw new InvalidInstructionStepException(0xE7)
+            },
+            // 0xE8 INX impl
+            0xE8 => CurrentInstructionStep switch
+            {
+                1 => InxCycle1(),
+                2 => InxCycle2(),
+                _ => throw new InvalidInstructionStepException(0xE8)
+            },
+            // 0xE9 SBC imm
+            0xE9 => CurrentInstructionStep switch
+            {
+                1 => SbcImmCycle1(),
+                2 => SbcImmCycle2(),
+                _ => throw new InvalidInstructionStepException(0xE9)
+            },
+            // 0xEA NOP impl
+            0xEA => CurrentInstructionStep switch
+            {
+                1 => NopImpliedCycle1(),
+                2 => NopImpliedCycle2(),
+                _ => throw new InvalidInstructionStepException(0xEA)
+            },
+            // 0xEB USBC imm
+            0xEB => CurrentInstructionStep switch
+            {
+                1 => UsbcCycle1(),
+                2 => UsbcCycle2(),
+                _ => throw new InvalidInstructionStepException(0xEB)
+            },
+            // 0xEC CPX abs
+            0xEC => CurrentInstructionStep switch
+            {
+                1 => CpxAbsoluteCycle1(),
+                2 => CpxAbsoluteCycle2(),
+                3 => CpxAbsoluteCycle3(),
+                4 => CpxAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xEC)
+            },
+            // 0xED SBC abs
+            0xED => CurrentInstructionStep switch
+            {
+                1 => SbcAbsoluteCycle1(),
+                2 => SbcAbsoluteCycle2(),
+                3 => SbcAbsoluteCycle3(),
+                4 => SbcAbsoluteCycle4(),
+                _ => throw new InvalidInstructionStepException(0xED)
+            },
+            // 0xEE INC abs
+            0xEE => CurrentInstructionStep switch
+            {
+                1 => IncAbsoluteCycle1(),
+                2 => IncAbsoluteCycle2(),
+                3 => IncAbsoluteCycle3(),
+                4 => IncAbsoluteCycle4(),
+                5 => IncAbsoluteCycle5(),
+                6 => IncAbsoluteCycle6(),
+                _ => throw new InvalidInstructionStepException(0xEE)
+            },
+            // 0xEF ISC abs
+            0xEF => CurrentInstructionStep switch
+            {
+                1 => IscAbsoluteCycle1(),
+                2 => IscAbsoluteCycle2(),
+                3 => IscAbsoluteCycle3(),
+                4 => IscAbsoluteCycle4(),
+                5 => IscAbsoluteCycle5(),
+                6 => IscAbsoluteCycle6(),
+                _ => throw new InvalidInstructionStepException(0xEF)
+            },
+            // 0xF0 BEQ rel
+            0xF0 => CurrentInstructionStep switch
+            {
+                1 => BeqCycle1(),
+                2 => BeqCycle2(),
+                3 => BeqCycle3(),
+                4 => BeqCycle4(),
+                _ => throw new InvalidInstructionStepException(0xF0)
+            },
+            // 0xF1 SBC ind, Y
+            0xF1 => CurrentInstructionStep switch
+            {
+                1 => SbcIndirectYCycle1(),
+                2 => SbcIndirectYCycle2(),
+                3 => SbcIndirectYCycle3(),
+                4 => SbcIndirectYCycle4(),
+                5 => SbcIndirectYCycle5(),
+                6 => SbcIndirectYCycle6(),
+                _ => throw new InvalidInstructionStepException(0xF1)
+            },
+            // 0xF2 JAM
+            0xF2 => Jam(),
+            // 0xF3 ISC ind, Y
+            0xF3 => CurrentInstructionStep switch
+            {
+                1 => IscIndirectYCycle1(),
+                2 => IscIndirectYCycle2(),
+                3 => IscIndirectYCycle3(),
+                4 => IscIndirectYCycle4(),
+                5 => IscIndirectYCycle5(),
+                6 => IscIndirectYCycle6(),
+                7 => IscIndirectYCycle7(),
+                8 => IscIndirectYCycle8(),
+                _ => throw new InvalidInstructionStepException(0xF3)
+            },
+            // 0xF4 NOP zpg, X
+            0xF4 => CurrentInstructionStep switch
+            {
+                1 => NopZeropageXCycle1(),
+                2 => NopZeropageXCycle2(),
+                3 => NopZeropageXCycle3(),
+                4 => NopZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xF4)
+            },
+            // 0xF5 SBC zpg, X
+            0xF5 => CurrentInstructionStep switch
+            {
+                1 => SbcZeropageXCycle1(),
+                2 => SbcZeropageXCycle2(),
+                3 => SbcZeropageXCycle3(),
+                4 => SbcZeropageXCycle4(),
+                _ => throw new InvalidInstructionStepException(0xF5)
+            },
+            // 0xF6 INC zpg, X
+            0xF6 => CurrentInstructionStep switch
+            {
+                1 => IncZeropageXCycle1(),
+                2 => IncZeropageXCycle2(),
+                3 => IncZeropageXCycle3(),
+                4 => IncZeropageXCycle4(),
+                5 => IncZeropageXCycle5(),
+                6 => IncZeropageXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xF6)
+            },
+            // 0xF7 ISC zpg, X
+            0xF7 => CurrentInstructionStep switch
+            {
+                1 => IscZeropageXCycle1(),
+                2 => IscZeropageXCycle2(),
+                3 => IscZeropageXCycle3(),
+                4 => IscZeropageXCycle4(),
+                5 => IscZeropageXCycle5(),
+                6 => IscZeropageXCycle6(),
+                _ => throw new InvalidInstructionStepException(0xF7)
+            },
+            // 0xF8 SED impl
+            0xF8 => CurrentInstructionStep switch
+            {
+                1 => SedCycle1(),
+                2 => SedCycle2(),
+                _ => throw new InvalidInstructionStepException(0xF8)
+            },
+            // 0xF9 SBC abs, Y
+            0xF9 => CurrentInstructionStep switch
+            {
+                1 => SbcAbsoluteYCycle1(),
+                2 => SbcAbsoluteYCycle2(),
+                3 => SbcAbsoluteYCycle3(),
+                4 => SbcAbsoluteYCycle4(),
+                5 => SbcAbsoluteYCycle5(),
+                _ => throw new InvalidInstructionStepException(0xF9)
+            },
+            // 0xFA NOP impl
+            0xFA => CurrentInstructionStep switch
+            {
+                1 => NopImpliedCycle1(),
+                2 => NopImpliedCycle2(),
+                _ => throw new InvalidInstructionStepException(0xFA)
+            },
+            // 0xFB ISC abs, Y
+            0xFB => CurrentInstructionStep switch
+            {
+                1 => IscAbsoluteYCycle1(),
+                2 => IscAbsoluteYCycle2(),
+                3 => IscAbsoluteYCycle3(),
+                4 => IscAbsoluteYCycle4(),
+                5 => IscAbsoluteYCycle5(),
+                6 => IscAbsoluteYCycle6(),
+                7 => IscAbsoluteYCycle7(),
+                _ => throw new InvalidInstructionStepException(0xFB)
+            },
+            // 0xFC NOP abs, X
+            0xFC => CurrentInstructionStep switch
+            {
+                1 => NopAbsoluteXCycle1(),
+                2 => NopAbsoluteXCycle2(),
+                3 => NopAbsoluteXCycle3(),
+                4 => NopAbsoluteXCycle4(),
+                5 => NopAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xFC)
+            },
+            // 0xFD SBC abs, X
+            0xFD => CurrentInstructionStep switch
+            {
+                1 => SbcAbsoluteXCycle1(),
+                2 => SbcAbsoluteXCycle2(),
+                3 => SbcAbsoluteXCycle3(),
+                4 => SbcAbsoluteXCycle4(),
+                5 => SbcAbsoluteXCycle5(),
+                _ => throw new InvalidInstructionStepException(0xFD)
+            },
+            // 0xFE INC abs, X
+            0xFE => CurrentInstructionStep switch
+            {
+                1 => IncAbsoluteXCycle1(),
+                2 => IncAbsoluteXCycle2(),
+                3 => IncAbsoluteXCycle3(),
+                4 => IncAbsoluteXCycle4(),
+                5 => IncAbsoluteXCycle5(),
+                6 => IncAbsoluteXCycle6(),
+                7 => IncAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0xFE)
+            },
+            // 0xFF ISC abs, X
+            0xFF => CurrentInstructionStep switch
+            {
+                1 => IscAbsoluteXCycle1(),
+                2 => IscAbsoluteXCycle2(),
+                3 => IscAbsoluteXCycle3(),
+                4 => IscAbsoluteXCycle4(),
+                5 => IscAbsoluteXCycle5(),
+                6 => IscAbsoluteXCycle6(),
+                7 => IscAbsoluteXCycle7(),
+                _ => throw new InvalidInstructionStepException(0xFF)
+            },
         };
 
-    protected ushort AlrCycle2()
+    private ushort AlrCycle2()
     {
         return 0;
     }
 
-    protected ushort AlrCycle1()
+    private ushort AlrCycle1()
     {
         return 0;
     }
 
     // usbc
-    protected ushort UsbcCycle2()
+    private ushort UsbcCycle2()
     {
         return 0;
     }
 
-    protected ushort UsbcCycle1()
+    private ushort UsbcCycle1()
     {
         return 0;
     }
 
     // sbx
-    protected ushort SbxCycle2()
+    private ushort SbxCycle2()
     {
         return 0;
     }
 
-    protected ushort SbxCycle1()
+    private ushort SbxCycle1()
     {
         return 0;
     }
 
     // isc
-    protected ushort IscZeropageCycle5()
+    private ushort IscZeropageCycle5()
     {
         return 0;
     }
 
-    protected ushort IscZeropageCycle4()
+    private ushort IscZeropageCycle4()
     {
         return 0;
     }
 
-    protected ushort IscZeropageCycle3()
+    private ushort IscZeropageCycle3()
     {
         return 0;
     }
 
-    protected ushort IscZeropageCycle2()
+    private ushort IscZeropageCycle2()
     {
         return 0;
     }
-    protected ushort IscZeropageCycle1()
-    {
-        return 0;
-    }
-
-
-    protected ushort IscZeropageXCycle6()
-    {
-        return 0;
-    }
-    protected ushort IscZeropageXCycle5()
-    {
-        return 0;
-    }
-    protected ushort IscZeropageXCycle4()
-    {
-        return 0;
-    }
-    protected ushort IscZeropageXCycle3()
-    {
-        return 0;
-    }
-    protected ushort IscZeropageXCycle2()
-    {
-        return 0;
-    }
-    protected ushort IscZeropageXCycle1()
+    private ushort IscZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort IscAbsoluteCycle6()
+
+    private ushort IscZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort IscAbsoluteCycle5()
+    private ushort IscZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort IscAbsoluteCycle4()
+    private ushort IscZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort IscAbsoluteCycle3()
+    private ushort IscZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort IscAbsoluteCycle2()
+    private ushort IscZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort IscAbsoluteCycle1()
+    private ushort IscZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort IscAbsoluteXCycle7()
+    private ushort IscAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort IscAbsoluteXCycle6()
+    private ushort IscAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort IscAbsoluteXCycle5()
+    private ushort IscAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort IscAbsoluteXCycle4()
+    private ushort IscAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort IscAbsoluteXCycle3()
+    private ushort IscAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort IscAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    protected ushort IscAbsoluteXCycle1()
+    private ushort IscAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort IscAbsoluteYCycle7()
+    private ushort IscAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle6()
+    private ushort IscAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle5()
+    private ushort IscAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle4()
+    private ushort IscAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle3()
+    private ushort IscAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle2()
+    private ushort IscAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort IscAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort IscIndirectXCycle8()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle7()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle6()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle5()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle4()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle3()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle2()
-    {
-        return 0;
-    }
-    protected ushort IscIndirectXCycle1()
+    private ushort IscAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort IscIndirectYCycle8()
+    private ushort IscAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle7()
+    private ushort IscAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle6()
+    private ushort IscAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle5()
+    private ushort IscAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle4()
+    private ushort IscAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle3()
+    private ushort IscAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle2()
+    private ushort IscAbsoluteYCycle1()
     {
         return 0;
     }
-    protected ushort IscIndirectYCycle1()
+
+    private ushort IscIndirectXCycle8()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle7()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle6()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle5()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle4()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle3()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle2()
+    {
+        return 0;
+    }
+    private ushort IscIndirectXCycle1()
+    {
+        return 0;
+    }
+
+    private ushort IscIndirectYCycle8()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle7()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle6()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle5()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle4()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle3()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle2()
+    {
+        return 0;
+    }
+    private ushort IscIndirectYCycle1()
     {
         return 0;
     }
 
     // dcp
-    protected ushort DcpZeropageCycle5()
+    private ushort DcpZeropageCycle5()
     {
         return 0;
     }
-    protected ushort DcpZeropageCycle4()
+    private ushort DcpZeropageCycle4()
     {
         return 0;
     }
-    protected ushort DcpZeropageCycle3()
+    private ushort DcpZeropageCycle3()
     {
         return 0;
     }
-    protected ushort DcpZeropageCycle2()
+    private ushort DcpZeropageCycle2()
     {
         return 0;
     }
-    protected ushort DcpZeropageCycle1()
-    {
-        return 0;
-    }
-
-
-    protected ushort DcpZeropageXCycle6()
-    {
-        return 0;
-    }
-    protected ushort DcpZeropageXCycle5()
-    {
-        return 0;
-    }
-    protected ushort DcpZeropageXCycle4()
-    {
-        return 0;
-    }
-    protected ushort DcpZeropageXCycle3()
-    {
-        return 0;
-    }
-    protected ushort DcpZeropageXCycle2()
-    {
-        return 0;
-    }
-    protected ushort DcpZeropageXCycle1()
+    private ushort DcpZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort DcpAbsoluteCycle6()
+
+    private ushort DcpZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteCycle5()
+    private ushort DcpZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteCycle4()
+    private ushort DcpZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteCycle3()
+    private ushort DcpZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteCycle2()
+    private ushort DcpZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteCycle1()
+    private ushort DcpZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort DcpAbsoluteXCycle7()
+    private ushort DcpAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteXCycle6()
+    private ushort DcpAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteXCycle5()
+    private ushort DcpAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteXCycle4()
+    private ushort DcpAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteXCycle3()
+    private ushort DcpAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    protected ushort DcpAbsoluteXCycle1()
+    private ushort DcpAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort DcpAbsoluteYCycle7()
+    private ushort DcpAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle6()
+    private ushort DcpAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle5()
+    private ushort DcpAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle4()
+    private ushort DcpAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle3()
+    private ushort DcpAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle2()
+    private ushort DcpAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort DcpAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort DcpIndirectXCycle8()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle7()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle6()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle5()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle4()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle3()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle2()
-    {
-        return 0;
-    }
-    protected ushort DcpIndirectXCycle1()
+    private ushort DcpAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort DcpIndirectYCycle8()
+    private ushort DcpAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle7()
+    private ushort DcpAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle6()
+    private ushort DcpAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle5()
+    private ushort DcpAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle4()
+    private ushort DcpAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle3()
+    private ushort DcpAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle2()
+    private ushort DcpAbsoluteYCycle1()
     {
         return 0;
     }
-    protected ushort DcpIndirectYCycle1()
+
+    private ushort DcpIndirectXCycle8()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle7()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle6()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle5()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle4()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle3()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle2()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectXCycle1()
+    {
+        return 0;
+    }
+
+    private ushort DcpIndirectYCycle8()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle7()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle6()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle5()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle4()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle3()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle2()
+    {
+        return 0;
+    }
+    private ushort DcpIndirectYCycle1()
     {
         return 0;
     }
 
     // las
 
-    protected ushort LasCycle4()
+    private ushort LasCycle4()
     {
         return 0;
     }
-    protected ushort LasCycle3()
+    private ushort LasCycle3()
     {
         return 0;
     }
-    protected ushort LasCycle2()
+    private ushort LasCycle2()
     {
         return 0;
     }
-    protected ushort LasCycle1()
+    private ushort LasCycle1()
     {
         return 0;
     }
 
     // lxa
-    protected ushort LxaCycle2()
+    private ushort LxaCycle2()
     {
         return 0;
     }
-    protected ushort LxaCycle1()
+    private ushort LxaCycle1()
     {
         return 0;
     }
 
     // lax
 
-    protected ushort LaxZeropageCycle3()
+    private ushort LaxZeropageCycle3()
     {
         return 0;
     }
-    protected ushort LaxZeropageCycle2()
+    private ushort LaxZeropageCycle2()
     {
         return 0;
     }
-    protected ushort LaxZeropageCycle1()
-    {
-        return 0;
-    }
-
-
-    protected ushort LaxZeropageYCycle4()
-    {
-        return 0;
-    }
-    protected ushort LaxZeropageYCycle3()
-    {
-        return 0;
-    }
-    protected ushort LaxZeropageYCycle2()
-    {
-        return 0;
-    }
-    protected ushort LaxZeropageYCycle1()
+    private ushort LaxZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort LaxAbsoluteCycle4()
+
+    private ushort LaxZeropageYCycle4()
     {
         return 0;
     }
-    protected ushort LaxAbsoluteCycle3()
+    private ushort LaxZeropageYCycle3()
+    {
+        return 0;
+    }
+    private ushort LaxZeropageYCycle2()
+    {
+        return 0;
+    }
+    private ushort LaxZeropageYCycle1()
     {
         return 0;
     }
 
-    protected ushort LaxAbsoluteCycle2()
+    private ushort LaxAbsoluteCycle4()
+    {
+        return 0;
+    }
+    private ushort LaxAbsoluteCycle3()
     {
         return 0;
     }
 
-    protected ushort LaxAbsoluteCycle1()
+    private ushort LaxAbsoluteCycle2()
     {
         return 0;
     }
 
-    protected ushort LaxAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    protected ushort LaxAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    protected ushort LaxAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    protected ushort LaxAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    protected ushort LaxAbsoluteYCycle1()
+    private ushort LaxAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort LaxIndirectXCycle6()
+    private ushort LaxAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort LaxIndirectXCycle5()
+    private ushort LaxAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort LaxIndirectXCycle4()
+    private ushort LaxAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort LaxIndirectXCycle3()
+    private ushort LaxAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort LaxIndirectXCycle2()
-    {
-        return 0;
-    }
-    protected ushort LaxIndirectXCycle1()
+    private ushort LaxAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort LaxIndirectYCycle6()
+    private ushort LaxIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort LaxIndirectYCycle5()
+    private ushort LaxIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort LaxIndirectYCycle4()
+    private ushort LaxIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort LaxIndirectYCycle3()
+    private ushort LaxIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort LaxIndirectYCycle2()
+    private ushort LaxIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort LaxIndirectYCycle1()
+    private ushort LaxIndirectXCycle1()
+    {
+        return 0;
+    }
+
+    private ushort LaxIndirectYCycle6()
+    {
+        return 0;
+    }
+    private ushort LaxIndirectYCycle5()
+    {
+        return 0;
+    }
+    private ushort LaxIndirectYCycle4()
+    {
+        return 0;
+    }
+    private ushort LaxIndirectYCycle3()
+    {
+        return 0;
+    }
+    private ushort LaxIndirectYCycle2()
+    {
+        return 0;
+    }
+    private ushort LaxIndirectYCycle1()
     {
         return 0;
     }
 
     // shx
-    protected ushort ShxCycle5()
+    private ushort ShxCycle5()
     {
         return 0;
     }
-    protected ushort ShxCycle4()
+    private ushort ShxCycle4()
     {
         return 0;
     }
-    protected ushort ShxCycle3()
+    private ushort ShxCycle3()
     {
         return 0;
     }
-    protected ushort ShxCycle2()
+    private ushort ShxCycle2()
     {
         return 0;
     }
-    protected ushort ShxCycle1()
+    private ushort ShxCycle1()
     {
         return 0;
     }
 
     // shy
-    protected ushort ShyCycle5()
+    private ushort ShyCycle5()
     {
         return 0;
     }
-    protected ushort ShyCycle4()
+    private ushort ShyCycle4()
     {
         return 0;
     }
-    protected ushort ShyCycle3()
+    private ushort ShyCycle3()
     {
         return 0;
     }
-    protected ushort ShyCycle2()
+    private ushort ShyCycle2()
     {
         return 0;
     }
-    protected ushort ShyCycle1()
+    private ushort ShyCycle1()
     {
         return 0;
     }
 
     // tas
-    protected ushort TasCycle5()
+    private ushort TasCycle5()
     {
         return 0;
     }
-    protected ushort TasCycle4()
+    private ushort TasCycle4()
     {
         return 0;
     }
-    protected ushort TasCycle3()
+    private ushort TasCycle3()
     {
         return 0;
     }
-    protected ushort TasCycle2()
+    private ushort TasCycle2()
     {
         return 0;
     }
-    protected ushort TasCycle1()
+    private ushort TasCycle1()
     {
         return 0;
     }
 
     // SHA
-    protected ushort ShaIndirectYCycle5()
+    private ushort ShaIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort ShaIndirectYCycle4()
+    private ushort ShaIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort ShaIndirectYCycle3()
+    private ushort ShaIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort ShaIndirectYCycle2()
+    private ushort ShaIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort ShaIndirectYCycle1()
+    private ushort ShaIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort ShaAbsoluteYCycle5()
+    private ushort ShaAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort ShaAbsoluteYCycle4()
+    private ushort ShaAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort ShaAbsoluteYCycle3()
+    private ushort ShaAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort ShaAbsoluteYCycle2()
+    private ushort ShaAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort ShaAbsoluteYCycle1()
+    private ushort ShaAbsoluteYCycle1()
     {
         return 0;
     }
 
     // JAM (illegal opcode).
-    protected ushort Jam()
+    private ushort Jam()
     {
         return 0;
     }
 
-    protected ushort TyaCycle2()
+    private ushort TyaCycle2()
     {
         return 0;
     }
-    protected ushort TyaCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort TxsCycle2()
-    {
-        return 0;
-    }
-    protected ushort TxsCycle1()
+    private ushort TyaCycle1()
     {
         return 0;
     }
 
-    protected ushort AneCycle2()
+    private ushort TxsCycle2()
     {
         return 0;
     }
-    protected ushort AneCycle1()
+    private ushort TxsCycle1()
+    {
+        return 0;
+    }
+
+    private ushort AneCycle2()
+    {
+        return 0;
+    }
+    private ushort AneCycle1()
     {
         return 0;
     }
 
     // NOPs (illegal opcodes).
-    protected ushort NopImpliedCycle2()
+    private ushort NopImpliedCycle2()
     {
         return 0;
     }
-    protected ushort NopImpliedCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort NopImmCycle2()
-    {
-        return 0;
-    }
-    protected ushort NopImmCycle1()
+    private ushort NopImpliedCycle1()
     {
         return 0;
     }
 
-    protected ushort NopZeropageCycle3()
+    private ushort NopImmCycle2()
     {
         return 0;
     }
-    protected ushort NopZeropageCycle2()
-    {
-        return 0;
-    }
-    protected ushort NopZeropageCycle1()
+    private ushort NopImmCycle1()
     {
         return 0;
     }
 
-    protected ushort NopZeropageXCycle4()
+    private ushort NopZeropageCycle3()
     {
         return 0;
     }
-    protected ushort NopZeropageXCycle3()
+    private ushort NopZeropageCycle2()
     {
         return 0;
     }
-    protected ushort NopZeropageXCycle2()
-    {
-        return 0;
-    }
-    protected ushort NopZeropageXCycle1()
+    private ushort NopZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort NopAbsoluteCycle4()
+    private ushort NopZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort NopAbsoluteCycle3()
+    private ushort NopZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort NopAbsoluteCycle2()
+    private ushort NopZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort NopAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort NopAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    protected ushort NopAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    protected ushort NopAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    protected ushort NopAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    protected ushort NopAbsoluteXCycle1()
+    private ushort NopZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort AncCycle3()
+    private ushort NopAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort AncCycle2()
+    private ushort NopAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort AncCycle1()
+    private ushort NopAbsoluteCycle2()
+    {
+        return 0;
+    }
+    private ushort NopAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort ArrCycle2()
+    private ushort NopAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort ArrCycle1()
+    private ushort NopAbsoluteXCycle4()
+    {
+        return 0;
+    }
+    private ushort NopAbsoluteXCycle3()
+    {
+        return 0;
+    }
+    private ushort NopAbsoluteXCycle2()
+    {
+        return 0;
+    }
+    private ushort NopAbsoluteXCycle1()
+    {
+        return 0;
+    }
+
+    private ushort AncCycle3()
+    {
+        return 0;
+    }
+    private ushort AncCycle2()
+    {
+        return 0;
+    }
+    private ushort AncCycle1()
+    {
+        return 0;
+    }
+
+    private ushort ArrCycle2()
+    {
+        return 0;
+    }
+    private ushort ArrCycle1()
     {
         return 0;
     }
 
     // Proper CPU instruction steps.
-    protected ushort ClcCycle2()
+    private ushort ClcCycle2()
     {
         return 0;
     }
-    protected ushort ClcCycle1()
+    private ushort ClcCycle1()
     {
         return 0;
     }
 
-    protected ushort SeiCycle2()
+    private ushort SeiCycle2()
     {
         return 0;
     }
-    protected ushort SeiCycle1()
+    private ushort SeiCycle1()
     {
         return 0;
     }
 
-    protected ushort PlaCycle4()
+    private ushort PlaCycle4()
     {
         return 0;
     }
-    protected ushort PlaCycle3()
+    private ushort PlaCycle3()
     {
         return 0;
     }
-    protected ushort PlaCycle2()
+    private ushort PlaCycle2()
     {
         return 0;
     }
-    protected ushort PlaCycle1()
+    private ushort PlaCycle1()
     {
         return 0;
     }
 
-    protected ushort DeyCycle2()
+    private ushort DeyCycle2()
     {
         return 0;
     }
-    protected ushort DeyCycle1()
+    private ushort DeyCycle1()
     {
         return 0;
     }
 
-    protected ushort TxaCycle2()
+    private ushort TxaCycle2()
     {
         return 0;
     }
-    protected ushort TxaCycle1()
+    private ushort TxaCycle1()
     {
         return 0;
     }
 
-    protected ushort SecCycle2()
+    private ushort SecCycle2()
     {
         return 0;
     }
-    protected ushort SecCycle1()
+    private ushort SecCycle1()
     {
         return 0;
     }
 
-    protected ushort PlpCycle4()
+    private ushort PlpCycle4()
     {
         return 0;
     }
-    protected ushort PlpCycle3()
+    private ushort PlpCycle3()
     {
         return 0;
     }
-    protected ushort PlpCycle2()
+    private ushort PlpCycle2()
     {
         return 0;
     }
-    protected ushort PlpCycle1()
+    private ushort PlpCycle1()
     {
         return 0;
     }
 
-    protected ushort PhaCycle3()
+    private ushort PhaCycle3()
     {
         return 0;
     }
-    protected ushort PhaCycle2()
+    private ushort PhaCycle2()
     {
         return 0;
     }
-    protected ushort PhaCycle1()
+    private ushort PhaCycle1()
     {
         return 0;
     }
 
-    protected ushort DexCycle2()
+    private ushort DexCycle2()
     {
         return 0;
     }
-    protected ushort DexCycle1()
+    private ushort DexCycle1()
     {
         return 0;
     }
 
-    protected ushort InyCycle2()
+    private ushort InyCycle2()
     {
         return 0;
     }
-    protected ushort InyCycle1()
+    private ushort InyCycle1()
     {
         return 0;
     }
 
-    protected ushort CldCycle2()
+    private ushort CldCycle2()
     {
         return 0;
     }
-    protected ushort CldCycle1()
+    private ushort CldCycle1()
     {
         return 0;
     }
 
-    protected ushort InxCycle2()
+    private ushort InxCycle2()
     {
         return 0;
     }
-    protected ushort InxCycle1()
+    private ushort InxCycle1()
     {
         return 0;
     }
 
-    protected ushort SedCycle2()
+    private ushort SedCycle2()
     {
         return 0;
     }
-    protected ushort SedCycle1()
+    private ushort SedCycle1()
     {
         return 0;
     }
 
-    protected ushort TaxCycle2()
+    private ushort TaxCycle2()
     {
         return 0;
     }
-    protected ushort TaxCycle1()
+    private ushort TaxCycle1()
     {
         return 0;
     }
 
-    protected ushort TsxCycle2()
+    private ushort TsxCycle2()
     {
         return 0;
     }
-    protected ushort TsxCycle1()
+    private ushort TsxCycle1()
     {
         return 0;
     }
 
-    protected ushort TayCycle2()
+    private ushort TayCycle2()
     {
         return 0;
     }
-    protected ushort TayCycle1()
+    private ushort TayCycle1()
     {
         return 0;
     }
 
-    protected ushort ClvCycle2()
+    private ushort ClvCycle2()
     {
         return 0;
     }
-    protected ushort ClvCycle1()
+    private ushort ClvCycle1()
     {
         return 0;
     }
 
-    protected ushort CliCycle2()
+    private ushort CliCycle2()
     {
         return 0;
     }
-    protected ushort CliCycle1()
+    private ushort CliCycle1()
     {
         return 0;
     }
 
-    protected ushort PhpCycle3()
+    private ushort PhpCycle3()
     {
         return 0;
     }
-    protected ushort PhpCycle2()
+    private ushort PhpCycle2()
     {
         return 0;
     }
-    protected ushort PhpCycle1()
+    private ushort PhpCycle1()
     {
         return 0;
     }
 
-    protected ushort BrkCycle7()
+    private ushort BrkCycle7()
     {
         return 0;
     }
-    protected ushort BrkCycle6()
+    private ushort BrkCycle6()
     {
         return 0;
     }
-    protected ushort BrkCycle5()
+    private ushort BrkCycle5()
     {
         return 0;
     }
-    protected ushort BrkCycle4()
+    private ushort BrkCycle4()
     {
         return 0;
     }
-    protected ushort BrkCycle3()
+    private ushort BrkCycle3()
     {
         return 0;
     }
-    protected ushort BrkCycle2()
+    private ushort BrkCycle2()
     {
         return 0;
     }
-    protected ushort BrkCycle1()
+    private ushort BrkCycle1()
     {
         return 0;
     }
 
-    protected ushort BplCycle4()
+    private ushort BplCycle4()
     {
         return 0;
     }
-    protected ushort BplCycle3()
+    private ushort BplCycle3()
     {
         return 0;
     }
-    protected ushort BplCycle2()
+    private ushort BplCycle2()
     {
         return 0;
     }
-    protected ushort BplCycle1()
+    private ushort BplCycle1()
     {
         return 0;
     }
 
-    protected ushort JsrCycle6()
+    private ushort JsrCycle6()
     {
         return 0;
     }
-    protected ushort JsrCycle5()
+    private ushort JsrCycle5()
     {
         return 0;
     }
-    protected ushort JsrCycle4()
+    private ushort JsrCycle4()
     {
         return 0;
     }
-    protected ushort JsrCycle3()
+    private ushort JsrCycle3()
     {
         return 0;
     }
-    protected ushort JsrCycle2()
+    private ushort JsrCycle2()
     {
         return 0;
     }
-    protected ushort JsrCycle1()
+    private ushort JsrCycle1()
     {
         return 0;
     }
 
-    protected ushort BmiCycle4()
+    private ushort BmiCycle4()
     {
         return 0;
     }
-    protected ushort BmiCycle3()
+    private ushort BmiCycle3()
     {
         return 0;
     }
-    protected ushort BmiCycle2()
+    private ushort BmiCycle2()
     {
         return 0;
     }
-    protected ushort BmiCycle1()
+    private ushort BmiCycle1()
     {
         return 0;
     }
 
-    protected ushort RtiCycle6()
+    private ushort RtiCycle6()
     {
         return 0;
     }
-    protected ushort RtiCycle5()
+    private ushort RtiCycle5()
     {
         return 0;
     }
-    protected ushort RtiCycle4()
+    private ushort RtiCycle4()
     {
         return 0;
     }
-    protected ushort RtiCycle3()
+    private ushort RtiCycle3()
     {
         return 0;
     }
-    protected ushort RtiCycle2()
+    private ushort RtiCycle2()
     {
         return 0;
     }
-    protected ushort RtiCycle1()
+    private ushort RtiCycle1()
     {
         return 0;
     }
 
-    protected ushort BvcCycle4()
+    private ushort BvcCycle4()
     {
         return 0;
     }
-    protected ushort BvcCycle3()
+    private ushort BvcCycle3()
     {
         return 0;
     }
-    protected ushort BvcCycle2()
+    private ushort BvcCycle2()
     {
         return 0;
     }
-    protected ushort BvcCycle1()
+    private ushort BvcCycle1()
     {
         return 0;
     }
 
-    protected ushort BvsCycle4()
+    private ushort BvsCycle4()
     {
         return 0;
     }
-    protected ushort BvsCycle3()
+    private ushort BvsCycle3()
     {
         return 0;
     }
-    protected ushort BvsCycle2()
+    private ushort BvsCycle2()
     {
         return 0;
     }
-    protected ushort BvsCycle1()
+    private ushort BvsCycle1()
     {
         return 0;
     }
 
 
-    protected ushort RtsCycle6()
+    private ushort RtsCycle6()
     {
         return 0;
     }
-    protected ushort RtsCycle5()
+    private ushort RtsCycle5()
     {
         return 0;
     }
-    protected ushort RtsCycle4()
+    private ushort RtsCycle4()
     {
         return 0;
     }
-    protected ushort RtsCycle3()
+    private ushort RtsCycle3()
     {
         return 0;
     }
-    protected ushort RtsCycle2()
+    private ushort RtsCycle2()
     {
         return 0;
     }
-    protected ushort RtsCycle1()
+    private ushort RtsCycle1()
     {
         return 0;
     }
 
-    protected ushort BccCycle4()
+    private ushort BccCycle4()
     {
         return 0;
     }
-    protected ushort BccCycle3()
+    private ushort BccCycle3()
     {
         return 0;
     }
-    protected ushort BccCycle2()
+    private ushort BccCycle2()
     {
         return 0;
     }
-    protected ushort BccCycle1()
+    private ushort BccCycle1()
     {
         return 0;
     }
 
-    protected ushort LdyImmCycle2()
+    private ushort LdyImmCycle2()
     {
         return 0;
     }
-    protected ushort LdyImmCycle1()
+    private ushort LdyImmCycle1()
     {
         return 0;
     }
 
-    protected ushort LdyZeropageCycle3()
+    private ushort LdyZeropageCycle3()
     {
         return 0;
     }
-    protected ushort LdyZeropageCycle2()
+    private ushort LdyZeropageCycle2()
     {
         return 0;
     }
-    protected ushort LdyZeropageCycle1()
+    private ushort LdyZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort LdyZeropageXCycle4()
+    private ushort LdyZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort LdyZeropageXCycle3()
+    private ushort LdyZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort LdyZeropageXCycle2()
+    private ushort LdyZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort LdyZeropageXCycle1()
+    private ushort LdyZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort LdyAbsoluteCycle4()
+    private ushort LdyAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteCycle3()
+    private ushort LdyAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteCycle2()
+    private ushort LdyAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteCycle1()
+    private ushort LdyAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort LdyAbsoluteXCycle5()
+    private ushort LdyAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteXCycle4()
+    private ushort LdyAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteXCycle3()
+    private ushort LdyAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteXCycle2()
+    private ushort LdyAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort LdyAbsoluteXCycle1()
+    private ushort LdyAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort BcsCycle4()
+    private ushort BcsCycle4()
     {
         return 0;
     }
-    protected ushort BcsCycle3()
+    private ushort BcsCycle3()
     {
         return 0;
     }
-    protected ushort BcsCycle2()
+    private ushort BcsCycle2()
     {
         return 0;
     }
-    protected ushort BcsCycle1()
+    private ushort BcsCycle1()
     {
         return 0;
     }
 
-    protected ushort CpyImmCycle2()
+    private ushort CpyImmCycle2()
     {
         return 0;
     }
-    protected ushort CpyImmCycle1()
+    private ushort CpyImmCycle1()
     {
         return 0;
     }
 
-    protected ushort CpyZeropageCycle3()
+    private ushort CpyZeropageCycle3()
     {
         return 0;
     }
-    protected ushort CpyZeropageCycle2()
+    private ushort CpyZeropageCycle2()
     {
         return 0;
     }
-    protected ushort CpyZeropageCycle1()
+    private ushort CpyZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort CpyAbsoluteCycle4()
+    private ushort CpyAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort CpyAbsoluteCycle3()
+    private ushort CpyAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort CpyAbsoluteCycle2()
+    private ushort CpyAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort CpyAbsoluteCycle1()
+    private ushort CpyAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort BneCycle4()
+    private ushort BneCycle4()
     {
         return 0;
     }
-    protected ushort BneCycle3()
+    private ushort BneCycle3()
     {
         return 0;
     }
-    protected ushort BneCycle2()
+    private ushort BneCycle2()
     {
         return 0;
     }
-    protected ushort BneCycle1()
+    private ushort BneCycle1()
     {
         return 0;
     }
 
-    protected ushort CpxImmCycle2()
+    private ushort CpxImmCycle2()
     {
         return 0;
     }
-    protected ushort CpxImmCycle1()
+    private ushort CpxImmCycle1()
     {
         return 0;
     }
 
-    protected ushort CpxZeropageCycle3()
+    private ushort CpxZeropageCycle3()
     {
         return 0;
     }
-    protected ushort CpxZeropageCycle2()
+    private ushort CpxZeropageCycle2()
     {
         return 0;
     }
-    protected ushort CpxZeropageCycle1()
+    private ushort CpxZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort CpxAbsoluteCycle4()
+    private ushort CpxAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort CpxAbsoluteCycle3()
+    private ushort CpxAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort CpxAbsoluteCycle2()
+    private ushort CpxAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort CpxAbsoluteCycle1()
+    private ushort CpxAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort BeqCycle4()
+    private ushort BeqCycle4()
     {
         return 0;
     }
-    protected ushort BeqCycle3()
+    private ushort BeqCycle3()
     {
         return 0;
     }
-    protected ushort BeqCycle2()
+    private ushort BeqCycle2()
     {
         return 0;
     }
-    protected ushort BeqCycle1()
+    private ushort BeqCycle1()
     {
         return 0;
     }
 
-    protected ushort OraImmCycle2()
+    private ushort OraImmCycle2()
     {
         return 0;
     }
 
-    protected ushort OraImmCycle1()
+    private ushort OraImmCycle1()
     {
         return 0;
     }
 
-    protected ushort OraZeropageCycle3()
+    private ushort OraZeropageCycle3()
     {
         return 0;
     }
-    protected ushort OraZeropageCycle2()
+    private ushort OraZeropageCycle2()
     {
         return 0;
     }
-    protected ushort OraZeropageCycle1()
+    private ushort OraZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort OraZeropageXCycle4()
+    private ushort OraZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort OraZeropageXCycle3()
+    private ushort OraZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort OraZeropageXCycle2()
+    private ushort OraZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort OraZeropageXCycle1()
+    private ushort OraZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort OraAbsoluteCycle4()
+    private ushort OraAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort OraAbsoluteCycle3()
+    private ushort OraAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort OraAbsoluteCycle2()
+    private ushort OraAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort OraAbsoluteCycle1()
+    private ushort OraAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort OraAbsoluteXCycle5()
+    private ushort OraAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort OraAbsoluteXCycle4()
+    private ushort OraAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort OraAbsoluteXCycle3()
+    private ushort OraAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort OraAbsoluteXCycle2()
+    private ushort OraAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort OraAbsoluteXCycle1()
+    private ushort OraAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort OraAbsoluteYCycle5()
+    private ushort OraAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort OraAbsoluteYCycle4()
+    private ushort OraAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort OraAbsoluteYCycle3()
+    private ushort OraAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort OraAbsoluteYCycle2()
+    private ushort OraAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort OraAbsoluteYCycle1()
+    private ushort OraAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort OraIndirectXCycle6()
+    private ushort OraIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort OraIndirectXCycle5()
+    private ushort OraIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort OraIndirectXCycle4()
+    private ushort OraIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort OraIndirectXCycle3()
+    private ushort OraIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort OraIndirectXCycle2()
+    private ushort OraIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort OraIndirectXCycle1()
+    private ushort OraIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort OraIndirectYCycle6()
+    private ushort OraIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort OraIndirectYCycle5()
+    private ushort OraIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort OraIndirectYCycle4()
+    private ushort OraIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort OraIndirectYCycle3()
+    private ushort OraIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort OraIndirectYCycle2()
+    private ushort OraIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort OraIndirectYCycle1()
+    private ushort OraIndirectYCycle1()
     {
         return 0;
     }
 
 
-    protected ushort AndImmCycle2()
+    private ushort AndImmCycle2()
     {
         return 0;
     }
-    protected ushort AndImmCycle1()
+    private ushort AndImmCycle1()
     {
         return 0;
     }
 
-    protected ushort AndZeropageCycle3()
+    private ushort AndZeropageCycle3()
     {
         return 0;
     }
-    protected ushort AndZeropageCycle2()
+    private ushort AndZeropageCycle2()
     {
         return 0;
     }
-    protected ushort AndZeropageCycle1()
+    private ushort AndZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort AndZeropageXCycle4()
+    private ushort AndZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort AndZeropageXCycle3()
+    private ushort AndZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort AndZeropageXCycle2()
+    private ushort AndZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort AndZeropageXCycle1()
+    private ushort AndZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort AndAbsoluteCycle4()
+    private ushort AndAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort AndAbsoluteCycle3()
+    private ushort AndAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort AndAbsoluteCycle2()
+    private ushort AndAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort AndAbsoluteCycle1()
+    private ushort AndAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort AndAbsoluteXCycle5()
+    private ushort AndAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort AndAbsoluteXCycle4()
+    private ushort AndAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort AndAbsoluteXCycle3()
+    private ushort AndAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort AndAbsoluteXCycle2()
+    private ushort AndAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort AndAbsoluteXCycle1()
+    private ushort AndAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort AndAbsoluteYCycle5()
+    private ushort AndAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort AndAbsoluteYCycle4()
+    private ushort AndAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort AndAbsoluteYCycle3()
+    private ushort AndAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort AndAbsoluteYCycle2()
+    private ushort AndAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort AndAbsoluteYCycle1()
+    private ushort AndAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort AndIndirectXCycle6()
+    private ushort AndIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort AndIndirectXCycle5()
+    private ushort AndIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort AndIndirectXCycle4()
+    private ushort AndIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort AndIndirectXCycle3()
+    private ushort AndIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort AndIndirectXCycle2()
+    private ushort AndIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort AndIndirectXCycle1()
+    private ushort AndIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort AndIndirectYCycle6()
+    private ushort AndIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort AndIndirectYCycle5()
+    private ushort AndIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort AndIndirectYCycle4()
+    private ushort AndIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort AndIndirectYCycle3()
+    private ushort AndIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort AndIndirectYCycle2()
+    private ushort AndIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort AndIndirectYCycle1()
+    private ushort AndIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort EorImmCycle2()
+    private ushort EorImmCycle2()
     {
         return 0;
     }
-    protected ushort EorImmCycle1()
+    private ushort EorImmCycle1()
     {
         return 0;
     }
 
-    protected ushort EorZeropageCycle3()
+    private ushort EorZeropageCycle3()
     {
         return 0;
     }
-    protected ushort EorZeropageCycle2()
+    private ushort EorZeropageCycle2()
     {
         return 0;
     }
-    protected ushort EorZeropageCycle1()
+    private ushort EorZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort EorZeropageXCycle4()
+    private ushort EorZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort EorZeropageXCycle3()
+    private ushort EorZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort EorZeropageXCycle2()
+    private ushort EorZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort EorZeropageXCycle1()
+    private ushort EorZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort EorAbsoluteCycle4()
+    private ushort EorAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort EorAbsoluteCycle3()
+    private ushort EorAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort EorAbsoluteCycle2()
+    private ushort EorAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort EorAbsoluteCycle1()
+    private ushort EorAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort EorAbsoluteXCycle5()
+    private ushort EorAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort EorAbsoluteXCycle4()
+    private ushort EorAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort EorAbsoluteXCycle3()
+    private ushort EorAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort EorAbsoluteXCycle2()
+    private ushort EorAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort EorAbsoluteXCycle1()
+    private ushort EorAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort EorAbsoluteYCycle5()
+    private ushort EorAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort EorAbsoluteYCycle4()
+    private ushort EorAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort EorAbsoluteYCycle3()
+    private ushort EorAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort EorAbsoluteYCycle2()
+    private ushort EorAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort EorAbsoluteYCycle1()
+    private ushort EorAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort EorIndirectXCycle6()
+    private ushort EorIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort EorIndirectXCycle5()
+    private ushort EorIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort EorIndirectXCycle4()
+    private ushort EorIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort EorIndirectXCycle3()
+    private ushort EorIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort EorIndirectXCycle2()
+    private ushort EorIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort EorIndirectXCycle1()
+    private ushort EorIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort EorIndirectYCycle6()
+    private ushort EorIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort EorIndirectYCycle5()
+    private ushort EorIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort EorIndirectYCycle4()
+    private ushort EorIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort EorIndirectYCycle3()
+    private ushort EorIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort EorIndirectYCycle2()
+    private ushort EorIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort EorIndirectYCycle1()
+    private ushort EorIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort StaZeropageCycle3()
+    private ushort StaZeropageCycle3()
     {
         return 0;
     }
-    protected ushort StaZeropageCycle2()
+    private ushort StaZeropageCycle2()
     {
         return 0;
     }
-    protected ushort StaZeropageCycle1()
+    private ushort StaZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort StaZeropageXCycle4()
+    private ushort StaZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort StaZeropageXCycle3()
+    private ushort StaZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort StaZeropageXCycle2()
+    private ushort StaZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort StaZeropageXCycle1()
+    private ushort StaZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort StaAbsoluteCycle4()
+    private ushort StaAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort StaAbsoluteCycle3()
+    private ushort StaAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort StaAbsoluteCycle2()
+    private ushort StaAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort StaAbsoluteCycle1()
+    private ushort StaAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort StaAbsoluteXCycle5()
+    private ushort StaAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort StaAbsoluteXCycle4()
+    private ushort StaAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort StaAbsoluteXCycle3()
+    private ushort StaAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort StaAbsoluteXCycle2()
+    private ushort StaAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort StaAbsoluteXCycle1()
+    private ushort StaAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort StaAbsoluteYCycle5()
+    private ushort StaAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort StaAbsoluteYCycle4()
+    private ushort StaAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort StaAbsoluteYCycle3()
+    private ushort StaAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort StaAbsoluteYCycle2()
+    private ushort StaAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort StaAbsoluteYCycle1()
+    private ushort StaAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort StaIndirectXCycle6()
+    private ushort StaIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort StaIndirectXCycle5()
+    private ushort StaIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort StaIndirectXCycle4()
+    private ushort StaIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort StaIndirectXCycle3()
+    private ushort StaIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort StaIndirectXCycle2()
+    private ushort StaIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort StaIndirectXCycle1()
+    private ushort StaIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort StaIndirectYCycle6()
+    private ushort StaIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort StaIndirectYCycle5()
+    private ushort StaIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort StaIndirectYCycle4()
+    private ushort StaIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort StaIndirectYCycle3()
+    private ushort StaIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort StaIndirectYCycle2()
+    private ushort StaIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort StaIndirectYCycle1()
+    private ushort StaIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaImmCycle2()
+    private ushort LdaImmCycle2()
     {
         return 0;
     }
-    protected ushort LdaImmCycle1()
+    private ushort LdaImmCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaZeropageCycle3()
+    private ushort LdaZeropageCycle3()
     {
         return 0;
     }
-    protected ushort LdaZeropageCycle2()
+    private ushort LdaZeropageCycle2()
     {
         return 0;
     }
-    protected ushort LdaZeropageCycle1()
+    private ushort LdaZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaZeropageXCycle4()
+    private ushort LdaZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort LdaZeropageXCycle3()
+    private ushort LdaZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort LdaZeropageXCycle2()
+    private ushort LdaZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort LdaZeropageXCycle1()
+    private ushort LdaZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaAbsoluteCycle4()
+    private ushort LdaAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteCycle3()
+    private ushort LdaAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteCycle2()
+    private ushort LdaAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteCycle1()
+    private ushort LdaAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaAbsoluteXCycle5()
+    private ushort LdaAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteXCycle4()
+    private ushort LdaAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteXCycle3()
+    private ushort LdaAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteXCycle2()
+    private ushort LdaAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteXCycle1()
+    private ushort LdaAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaAbsoluteYCycle5()
+    private ushort LdaAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteYCycle4()
+    private ushort LdaAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteYCycle3()
+    private ushort LdaAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteYCycle2()
+    private ushort LdaAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort LdaAbsoluteYCycle1()
+    private ushort LdaAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaIndirectXCycle6()
+    private ushort LdaIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort LdaIndirectXCycle5()
+    private ushort LdaIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort LdaIndirectXCycle4()
+    private ushort LdaIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort LdaIndirectXCycle3()
+    private ushort LdaIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort LdaIndirectXCycle2()
+    private ushort LdaIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort LdaIndirectXCycle1()
+    private ushort LdaIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort LdaIndirectYCycle6()
+    private ushort LdaIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort LdaIndirectYCycle5()
+    private ushort LdaIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort LdaIndirectYCycle4()
+    private ushort LdaIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort LdaIndirectYCycle3()
+    private ushort LdaIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort LdaIndirectYCycle2()
+    private ushort LdaIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort LdaIndirectYCycle1()
+    private ushort LdaIndirectYCycle1()
     {
         return 0;
     }
 
 
 
-    protected ushort CmpImmCycle2()
+    private ushort CmpImmCycle2()
     {
         return 0;
     }
-    protected ushort CmpImmCycle1()
+    private ushort CmpImmCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpZeropageCycle3()
+    private ushort CmpZeropageCycle3()
     {
         return 0;
     }
-    protected ushort CmpZeropageCycle2()
+    private ushort CmpZeropageCycle2()
     {
         return 0;
     }
-    protected ushort CmpZeropageCycle1()
+    private ushort CmpZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpZeropageXCycle4()
+    private ushort CmpZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort CmpZeropageXCycle3()
+    private ushort CmpZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort CmpZeropageXCycle2()
+    private ushort CmpZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort CmpZeropageXCycle1()
+    private ushort CmpZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpAbsoluteCycle4()
+    private ushort CmpAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteCycle3()
+    private ushort CmpAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteCycle2()
+    private ushort CmpAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteCycle1()
+    private ushort CmpAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpAbsoluteXCycle5()
+    private ushort CmpAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteXCycle4()
+    private ushort CmpAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteXCycle3()
+    private ushort CmpAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteXCycle2()
+    private ushort CmpAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteXCycle1()
+    private ushort CmpAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpAbsoluteYCycle5()
+    private ushort CmpAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteYCycle4()
+    private ushort CmpAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteYCycle3()
+    private ushort CmpAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteYCycle2()
+    private ushort CmpAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort CmpAbsoluteYCycle1()
+    private ushort CmpAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpIndirectXCycle6()
+    private ushort CmpIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort CmpIndirectXCycle5()
+    private ushort CmpIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort CmpIndirectXCycle4()
+    private ushort CmpIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort CmpIndirectXCycle3()
+    private ushort CmpIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort CmpIndirectXCycle2()
+    private ushort CmpIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort CmpIndirectXCycle1()
+    private ushort CmpIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort CmpIndirectYCycle6()
+    private ushort CmpIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort CmpIndirectYCycle5()
+    private ushort CmpIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort CmpIndirectYCycle4()
+    private ushort CmpIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort CmpIndirectYCycle3()
+    private ushort CmpIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort CmpIndirectYCycle2()
+    private ushort CmpIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort CmpIndirectYCycle1()
+    private ushort CmpIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcImmCycle2()
+    private ushort SbcImmCycle2()
     {
         return 0;
     }
-    protected ushort SbcImmCycle1()
+    private ushort SbcImmCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcZeropageCycle3()
+    private ushort SbcZeropageCycle3()
     {
         return 0;
     }
-    protected ushort SbcZeropageCycle2()
+    private ushort SbcZeropageCycle2()
     {
         return 0;
     }
-    protected ushort SbcZeropageCycle1()
+    private ushort SbcZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcZeropageXCycle4()
+    private ushort SbcZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort SbcZeropageXCycle3()
+    private ushort SbcZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort SbcZeropageXCycle2()
+    private ushort SbcZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort SbcZeropageXCycle1()
+    private ushort SbcZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcAbsoluteCycle4()
+    private ushort SbcAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteCycle3()
+    private ushort SbcAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteCycle2()
+    private ushort SbcAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteCycle1()
+    private ushort SbcAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcAbsoluteXCycle5()
+    private ushort SbcAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteXCycle4()
+    private ushort SbcAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteXCycle3()
+    private ushort SbcAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteXCycle2()
+    private ushort SbcAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteXCycle1()
+    private ushort SbcAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcAbsoluteYCycle5()
+    private ushort SbcAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteYCycle4()
+    private ushort SbcAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteYCycle3()
+    private ushort SbcAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteYCycle2()
+    private ushort SbcAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort SbcAbsoluteYCycle1()
+    private ushort SbcAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcIndirectXCycle6()
+    private ushort SbcIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort SbcIndirectXCycle5()
+    private ushort SbcIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort SbcIndirectXCycle4()
+    private ushort SbcIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort SbcIndirectXCycle3()
+    private ushort SbcIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort SbcIndirectXCycle2()
+    private ushort SbcIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort SbcIndirectXCycle1()
+    private ushort SbcIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort SbcIndirectYCycle6()
+    private ushort SbcIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort SbcIndirectYCycle5()
+    private ushort SbcIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort SbcIndirectYCycle4()
+    private ushort SbcIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort SbcIndirectYCycle3()
+    private ushort SbcIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort SbcIndirectYCycle2()
+    private ushort SbcIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort SbcIndirectYCycle1()
+    private ushort SbcIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort LdxImmCycle2()
+    private ushort LdxImmCycle2()
     {
         return 0;
     }
-    protected ushort LdxImmCycle1()
+    private ushort LdxImmCycle1()
     {
         return 0;
     }
 
-    protected ushort LdxZeropageCycle3()
+    private ushort LdxZeropageYCycle1()
     {
         return 0;
     }
-    protected ushort LdxZeropageCycle2()
+    
+    private ushort LdxZeropageYCycle2()
     {
         return 0;
     }
-    protected ushort LdxZeropageCycle1()
+    
+    private ushort LdxZeropageYCycle3()
     {
         return 0;
     }
-
-    protected ushort LdxZeropageXCycle4()
+    
+    private ushort LdxZeropageYCycle4()
     {
         return 0;
     }
-    protected ushort LdxZeropageXCycle3()
+
+    private ushort LdxZeropageCycle3()
     {
         return 0;
     }
-    protected ushort LdxZeropageXCycle2()
+    private ushort LdxZeropageCycle2()
     {
         return 0;
     }
-    protected ushort LdxZeropageXCycle1()
+    private ushort LdxZeropageCycle1()
     {
         return 0;
     }
+
 
-    protected ushort LdxAbsoluteCycle4()
+    private ushort LdxAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteCycle3()
+    private ushort LdxAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteCycle2()
+    private ushort LdxAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteCycle1()
+    private ushort LdxAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort LdxAbsoluteYCycle5()
+    private ushort LdxAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteYCycle4()
+    private ushort LdxAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteYCycle3()
+    private ushort LdxAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteYCycle2()
+    private ushort LdxAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort LdxAbsoluteYCycle1()
+    private ushort LdxAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort BitZeropageCycle3()
+    private ushort BitZeropageCycle3()
     {
         return 0;
     }
-    protected ushort BitZeropageCycle2()
+    private ushort BitZeropageCycle2()
     {
         return 0;
     }
-    protected ushort BitZeropageCycle1()
+    private ushort BitZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort BitAbsoluteCycle4()
+    private ushort BitAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort BitAbsoluteCycle3()
+    private ushort BitAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort BitAbsoluteCycle2()
+    private ushort BitAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort BitAbsoluteCycle1()
+    private ushort BitAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort StyZeropageCycle3()
+    private ushort StyZeropageCycle3()
     {
         return 0;
     }
-    protected ushort StyZeropageCycle2()
+    private ushort StyZeropageCycle2()
     {
         return 0;
     }
-    protected ushort StyZeropageCycle1()
+    private ushort StyZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort StyZeropageXCycle4()
+    private ushort StyZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort StyZeropageXCycle3()
+    private ushort StyZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort StyZeropageXCycle2()
+    private ushort StyZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort StyZeropageXCycle1()
+    private ushort StyZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort StyAbsoluteCycle4()
+    private ushort StyAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort StyAbsoluteCycle3()
+    private ushort StyAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort StyAbsoluteCycle2()
+    private ushort StyAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort StyAbsoluteCycle1()
+    private ushort StyAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcImmCycle2()
+    private ushort AdcImmCycle2()
     {
         return 0;
     }
-    protected ushort AdcImmCycle1()
+    private ushort AdcImmCycle1()
     {
-        return 0;
+        return 1;
     }
 
-    protected ushort AdcZeropageCycle3()
+    private ushort AdcZeropageCycle3()
     {
         return 0;
     }
-    protected ushort AdcZeropageCycle2()
+    private ushort AdcZeropageCycle2()
     {
         return 0;
     }
-    protected ushort AdcZeropageCycle1()
+    private ushort AdcZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcZeropageXCycle4()
+    private ushort AdcZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort AdcZeropageXCycle3()
+    private ushort AdcZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort AdcZeropageXCycle2()
+    private ushort AdcZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort AdcZeropageXCycle1()
+    private ushort AdcZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcAbsoluteCycle4()
+    private ushort AdcAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteCycle3()
+    private ushort AdcAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteCycle2()
+    private ushort AdcAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteCycle1()
+    private ushort AdcAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcAbsoluteXCycle5()
+    private ushort AdcAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteXCycle4()
+    private ushort AdcAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteXCycle3()
+    private ushort AdcAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteXCycle2()
+    private ushort AdcAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteXCycle1()
+    private ushort AdcAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcAbsoluteYCycle5()
+    private ushort AdcAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteYCycle4()
+    private ushort AdcAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteYCycle3()
+    private ushort AdcAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteYCycle2()
+    private ushort AdcAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort AdcAbsoluteYCycle1()
+    private ushort AdcAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcIndirectXCycle6()
+    private ushort AdcIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort AdcIndirectXCycle5()
+    private ushort AdcIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort AdcIndirectXCycle4()
+    private ushort AdcIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort AdcIndirectXCycle3()
+    private ushort AdcIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort AdcIndirectXCycle2()
+    private ushort AdcIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort AdcIndirectXCycle1()
+    private ushort AdcIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort AdcIndirectYCycle6()
+    private ushort AdcIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort AdcIndirectYCycle5()
+    private ushort AdcIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort AdcIndirectYCycle4()
+    private ushort AdcIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort AdcIndirectYCycle3()
+    private ushort AdcIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort AdcIndirectYCycle2()
+    private ushort AdcIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort AdcIndirectYCycle1()
+    private ushort AdcIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort AslAccumCycle2()
+    private ushort AslAccumCycle2()
     {
         return 0;
     }
-    protected ushort AslAccumCycle1()
+    private ushort AslAccumCycle1()
     {
         return 0;
     }
 
-    protected ushort AslZeropageCycle5()
+    private ushort AslZeropageCycle5()
     {
         return 0;
     }
-    protected ushort AslZeropageCycle4()
+    private ushort AslZeropageCycle4()
     {
         return 0;
     }
-    protected ushort AslZeropageCycle3()
+    private ushort AslZeropageCycle3()
     {
         return 0;
     }
-    protected ushort AslZeropageCycle2()
+    private ushort AslZeropageCycle2()
     {
         return 0;
     }
-    protected ushort AslZeropageCycle1()
+    private ushort AslZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort AslZeropageXCycle6()
+    private ushort AslZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort AslZeropageXCycle5()
+    private ushort AslZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort AslZeropageXCycle4()
+    private ushort AslZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort AslZeropageXCycle3()
+    private ushort AslZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort AslZeropageXCycle2()
+    private ushort AslZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort AslZeropageXCycle1()
+    private ushort AslZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort AslAbsoluteCycle6()
+    private ushort AslAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort AslAbsoluteCycle5()
+    private ushort AslAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort AslAbsoluteCycle4()
+    private ushort AslAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort AslAbsoluteCycle3()
+    private ushort AslAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort AslAbsoluteCycle2()
+    private ushort AslAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort AslAbsoluteCycle1()
+    private ushort AslAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort AslAbsoluteXCycle7()
+    private ushort AslAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle6()
+    private ushort AslAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle5()
+    private ushort AslAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle4()
+    private ushort AslAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle3()
+    private ushort AslAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle2()
+    private ushort AslAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort AslAbsoluteXCycle1()
+    private ushort AslAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort RolAccumCycle2()
+    private ushort RolAccumCycle2()
     {
         return 0;
     }
-    protected ushort RolAccumCycle1()
+    private ushort RolAccumCycle1()
     {
         return 0;
     }
 
-    protected ushort RolZeropageCycle5()
+    private ushort RolZeropageCycle5()
     {
         return 0;
     }
-    protected ushort RolZeropageCycle4()
+    private ushort RolZeropageCycle4()
     {
         return 0;
     }
-    protected ushort RolZeropageCycle3()
+    private ushort RolZeropageCycle3()
     {
         return 0;
     }
-    protected ushort RolZeropageCycle2()
+    private ushort RolZeropageCycle2()
     {
         return 0;
     }
-    protected ushort RolZeropageCycle1()
+    private ushort RolZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort RolZeropageXCycle6()
+    private ushort RolZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort RolZeropageXCycle5()
+    private ushort RolZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort RolZeropageXCycle4()
+    private ushort RolZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort RolZeropageXCycle3()
+    private ushort RolZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort RolZeropageXCycle2()
+    private ushort RolZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort RolZeropageXCycle1()
+    private ushort RolZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort RolAbsoluteCycle6()
+    private ushort RolAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort RolAbsoluteCycle5()
+    private ushort RolAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort RolAbsoluteCycle4()
+    private ushort RolAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort RolAbsoluteCycle3()
+    private ushort RolAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort RolAbsoluteCycle2()
+    private ushort RolAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort RolAbsoluteCycle1()
+    private ushort RolAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort RolAbsoluteXCycle7()
+    private ushort RolAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle6()
+    private ushort RolAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle5()
+    private ushort RolAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle4()
+    private ushort RolAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle3()
+    private ushort RolAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle2()
+    private ushort RolAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort RolAbsoluteXCycle1()
+    private ushort RolAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort RorAccumCycle2()
+    private ushort RorAccumCycle2()
     {
         return 0;
     }
-    protected ushort RorAccumCycle1()
+    private ushort RorAccumCycle1()
     {
         return 0;
     }
 
-    protected ushort RorZeropageCycle5()
+    private ushort RorZeropageCycle5()
     {
         return 0;
     }
-    protected ushort RorZeropageCycle4()
+    private ushort RorZeropageCycle4()
     {
         return 0;
     }
-    protected ushort RorZeropageCycle3()
+    private ushort RorZeropageCycle3()
     {
         return 0;
     }
-    protected ushort RorZeropageCycle2()
+    private ushort RorZeropageCycle2()
     {
         return 0;
     }
-    protected ushort RorZeropageCycle1()
+    private ushort RorZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort RorZeropageXCycle6()
+    private ushort RorZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort RorZeropageXCycle5()
+    private ushort RorZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort RorZeropageXCycle4()
+    private ushort RorZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort RorZeropageXCycle3()
+    private ushort RorZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort RorZeropageXCycle2()
+    private ushort RorZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort RorZeropageXCycle1()
+    private ushort RorZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort RorAbsoluteCycle6()
+    private ushort RorAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort RorAbsoluteCycle5()
+    private ushort RorAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort RorAbsoluteCycle4()
+    private ushort RorAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort RorAbsoluteCycle3()
+    private ushort RorAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort RorAbsoluteCycle2()
+    private ushort RorAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort RorAbsoluteCycle1()
+    private ushort RorAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort RorAbsoluteXCycle7()
+    private ushort RorAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle6()
+    private ushort RorAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle5()
+    private ushort RorAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle4()
+    private ushort RorAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle3()
+    private ushort RorAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle2()
+    private ushort RorAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort RorAbsoluteXCycle1()
+    private ushort RorAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort SloAbsoluteCycle6()
+    private ushort SloAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort SloAbsoluteCycle5()
+    private ushort SloAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort SloAbsoluteCycle4()
+    private ushort SloAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort SloAbsoluteCycle3()
+    private ushort SloAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort SloAbsoluteCycle2()
+    private ushort SloAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort SloAbsoluteCycle1()
+    private ushort SloAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort SloAbsoluteXCycle7()
+    private ushort SloAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle6()
+    private ushort SloAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle5()
+    private ushort SloAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle4()
+    private ushort SloAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle3()
+    private ushort SloAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle2()
+    private ushort SloAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort SloAbsoluteXCycle1()
+    private ushort SloAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort SloAbsoluteYCycle7()
+    private ushort SloAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle6()
+    private ushort SloAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle5()
+    private ushort SloAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle4()
+    private ushort SloAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle3()
+    private ushort SloAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle2()
+    private ushort SloAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort SloAbsoluteYCycle1()
+    private ushort SloAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort SloZeropageCycle5()
+    private ushort SloZeropageCycle5()
     {
         return 0;
     }
-    protected ushort SloZeropageCycle4()
+    private ushort SloZeropageCycle4()
     {
         return 0;
     }
-    protected ushort SloZeropageCycle3()
+    private ushort SloZeropageCycle3()
     {
         return 0;
     }
-    protected ushort SloZeropageCycle2()
+    private ushort SloZeropageCycle2()
     {
         return 0;
     }
-    protected ushort SloZeropageCycle1()
+    private ushort SloZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort SloIndirectXCycle8()
+    private ushort SloIndirectXCycle8()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle7()
+    private ushort SloIndirectXCycle7()
     {
         return 0;
     }
 
-    protected ushort SloIndirectXCycle6()
+    private ushort SloIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle5()
+    private ushort SloIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle4()
+    private ushort SloIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle3()
+    private ushort SloIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle2()
+    private ushort SloIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort SloIndirectXCycle1()
+    private ushort SloIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort SloIndirectYCycle8()
+    private ushort SloIndirectYCycle8()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle7()
+    private ushort SloIndirectYCycle7()
     {
         return 0;
     }
 
-    protected ushort SloIndirectYCycle6()
+    private ushort SloIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle5()
+    private ushort SloIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle4()
+    private ushort SloIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle3()
+    private ushort SloIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle2()
+    private ushort SloIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort SloIndirectYCycle1()
+    private ushort SloIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaAbsoluteCycle6()
+    private ushort RlaAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteCycle5()
+    private ushort RlaAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteCycle4()
+    private ushort RlaAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteCycle3()
+    private ushort RlaAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteCycle2()
+    private ushort RlaAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteCycle1()
+    private ushort RlaAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaAbsoluteXCycle7()
+    private ushort RlaAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle6()
+    private ushort RlaAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle5()
+    private ushort RlaAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle4()
+    private ushort RlaAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle3()
+    private ushort RlaAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle2()
+    private ushort RlaAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteXCycle1()
+    private ushort RlaAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaAbsoluteYCycle7()
+    private ushort RlaAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle6()
+    private ushort RlaAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle5()
+    private ushort RlaAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle4()
+    private ushort RlaAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle3()
+    private ushort RlaAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle2()
+    private ushort RlaAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort RlaAbsoluteYCycle1()
+    private ushort RlaAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaZeropageCycle5()
+    private ushort RlaZeropageCycle5()
     {
         return 0;
     }
-    protected ushort RlaZeropageCycle4()
+    private ushort RlaZeropageCycle4()
     {
         return 0;
     }
-    protected ushort RlaZeropageCycle3()
+    private ushort RlaZeropageCycle3()
     {
         return 0;
     }
-    protected ushort RlaZeropageCycle2()
+    private ushort RlaZeropageCycle2()
     {
         return 0;
     }
-    protected ushort RlaZeropageCycle1()
+    private ushort RlaZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaZeropageXCycle6()
+    private ushort RlaZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort RlaZeropageXCycle5()
+    private ushort RlaZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort RlaZeropageXCycle4()
+    private ushort RlaZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort RlaZeropageXCycle3()
+    private ushort RlaZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort RlaZeropageXCycle2()
+    private ushort RlaZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort RlaZeropageXCycle1()
+    private ushort RlaZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaIndirectXCycle8()
+    private ushort RlaIndirectXCycle8()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle7()
+    private ushort RlaIndirectXCycle7()
     {
         return 0;
     }
 
-    protected ushort RlaIndirectXCycle6()
+    private ushort RlaIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle5()
+    private ushort RlaIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle4()
+    private ushort RlaIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle3()
+    private ushort RlaIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle2()
+    private ushort RlaIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort RlaIndirectXCycle1()
+    private ushort RlaIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort RlaIndirectYCycle8()
+    private ushort RlaIndirectYCycle8()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle7()
+    private ushort RlaIndirectYCycle7()
     {
         return 0;
     }
 
-    protected ushort RlaIndirectYCycle6()
+    private ushort RlaIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle5()
+    private ushort RlaIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle4()
+    private ushort RlaIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle3()
+    private ushort RlaIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle2()
+    private ushort RlaIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort RlaIndirectYCycle1()
+    private ushort RlaIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort SreAbsoluteCycle6()
+    private ushort SreAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort SreAbsoluteCycle5()
+    private ushort SreAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort SreAbsoluteCycle4()
+    private ushort SreAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort SreAbsoluteCycle3()
+    private ushort SreAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort SreAbsoluteCycle2()
+    private ushort SreAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort SreAbsoluteCycle1()
+    private ushort SreAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort SreAbsoluteXCycle7()
+    private ushort SreAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle6()
+    private ushort SreAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle5()
+    private ushort SreAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle4()
+    private ushort SreAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle3()
+    private ushort SreAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle2()
+    private ushort SreAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort SreAbsoluteXCycle1()
+    private ushort SreAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort SreAbsoluteYCycle7()
+    private ushort SreAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle6()
+    private ushort SreAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle5()
+    private ushort SreAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle4()
+    private ushort SreAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle3()
+    private ushort SreAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle2()
+    private ushort SreAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort SreAbsoluteYCycle1()
+    private ushort SreAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort SreZeropageCycle5()
+    private ushort SreZeropageCycle5()
     {
         return 0;
     }
-    protected ushort SreZeropageCycle4()
+    private ushort SreZeropageCycle4()
     {
         return 0;
     }
-    protected ushort SreZeropageCycle3()
+    private ushort SreZeropageCycle3()
     {
         return 0;
     }
-    protected ushort SreZeropageCycle2()
+    private ushort SreZeropageCycle2()
     {
         return 0;
     }
-    protected ushort SreZeropageCycle1()
+    private ushort SreZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort SreZeropageXCycle6()
+    private ushort SreZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort SreZeropageXCycle5()
+    private ushort SreZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort SreZeropageXCycle4()
+    private ushort SreZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort SreZeropageXCycle3()
+    private ushort SreZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort SreZeropageXCycle2()
+    private ushort SreZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort SreZeropageXCycle1()
+    private ushort SreZeropageXCycle1()
     {
         return 0;
     }
 
 
-    protected ushort SreIndirectXCycle8()
+    private ushort SreIndirectXCycle8()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle7()
+    private ushort SreIndirectXCycle7()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle6()
+    private ushort SreIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle5()
+    private ushort SreIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle4()
+    private ushort SreIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle3()
+    private ushort SreIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle2()
+    private ushort SreIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort SreIndirectXCycle1()
+    private ushort SreIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort SreIndirectYCycle8()
+    private ushort SreIndirectYCycle8()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle7()
+    private ushort SreIndirectYCycle7()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle6()
+    private ushort SreIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle5()
+    private ushort SreIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle4()
+    private ushort SreIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle3()
+    private ushort SreIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle2()
+    private ushort SreIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort SreIndirectYCycle1()
+    private ushort SreIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort LsrAccumCycle2()
+    private ushort LsrAccumCycle2()
     {
         return 0;
     }
-    protected ushort LsrAccumCycle1()
+    private ushort LsrAccumCycle1()
     {
         return 0;
     }
 
-    protected ushort LsrZeropageCycle5()
+    private ushort LsrZeropageCycle5()
     {
         return 0;
     }
-    protected ushort LsrZeropageCycle4()
+    private ushort LsrZeropageCycle4()
     {
         return 0;
     }
-    protected ushort LsrZeropageCycle3()
+    private ushort LsrZeropageCycle3()
     {
         return 0;
     }
-    protected ushort LsrZeropageCycle2()
+    private ushort LsrZeropageCycle2()
     {
         return 0;
     }
-    protected ushort LsrZeropageCycle1()
+    private ushort LsrZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort LsrZeropageXCycle6()
+    private ushort LsrZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort LsrZeropageXCycle5()
+    private ushort LsrZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort LsrZeropageXCycle4()
+    private ushort LsrZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort LsrZeropageXCycle3()
+    private ushort LsrZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort LsrZeropageXCycle2()
+    private ushort LsrZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort LsrZeropageXCycle1()
+    private ushort LsrZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort LsrAbsoluteCycle6()
+    private ushort LsrAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteCycle5()
+    private ushort LsrAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteCycle4()
+    private ushort LsrAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteCycle3()
+    private ushort LsrAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteCycle2()
+    private ushort LsrAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteCycle1()
+    private ushort LsrAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort LsrAbsoluteXCycle7()
+    private ushort LsrAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle6()
+    private ushort LsrAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle5()
+    private ushort LsrAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle4()
+    private ushort LsrAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle3()
+    private ushort LsrAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle2()
+    private ushort LsrAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort LsrAbsoluteXCycle1()
+    private ushort LsrAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort RraAbsoluteCycle6()
+    private ushort RraAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort RraAbsoluteCycle5()
+    private ushort RraAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort RraAbsoluteCycle4()
+    private ushort RraAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort RraAbsoluteCycle3()
+    private ushort RraAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort RraAbsoluteCycle2()
+    private ushort RraAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort RraAbsoluteCycle1()
+    private ushort RraAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort RraAbsoluteXCycle7()
+    private ushort RraAbsoluteXCycle7()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle6()
+    private ushort RraAbsoluteXCycle6()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle5()
+    private ushort RraAbsoluteXCycle5()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle4()
+    private ushort RraAbsoluteXCycle4()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle3()
+    private ushort RraAbsoluteXCycle3()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle2()
+    private ushort RraAbsoluteXCycle2()
     {
         return 0;
     }
-    protected ushort RraAbsoluteXCycle1()
+    private ushort RraAbsoluteXCycle1()
     {
         return 0;
     }
 
-    protected ushort RraAbsoluteYCycle7()
+    private ushort RraAbsoluteYCycle7()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle6()
+    private ushort RraAbsoluteYCycle6()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle5()
+    private ushort RraAbsoluteYCycle5()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle4()
+    private ushort RraAbsoluteYCycle4()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle3()
+    private ushort RraAbsoluteYCycle3()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle2()
+    private ushort RraAbsoluteYCycle2()
     {
         return 0;
     }
-    protected ushort RraAbsoluteYCycle1()
+    private ushort RraAbsoluteYCycle1()
     {
         return 0;
     }
 
-    protected ushort RraZeropageCycle5()
+    private ushort RraZeropageCycle5()
     {
         return 0;
     }
-    protected ushort RraZeropageCycle4()
+    private ushort RraZeropageCycle4()
     {
         return 0;
     }
-    protected ushort RraZeropageCycle3()
+    private ushort RraZeropageCycle3()
     {
         return 0;
     }
-    protected ushort RraZeropageCycle2()
+    private ushort RraZeropageCycle2()
     {
         return 0;
     }
-    protected ushort RraZeropageCycle1()
+    private ushort RraZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort RraZeropageXCycle6()
+    private ushort RraZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort RraZeropageXCycle5()
+    private ushort RraZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort RraZeropageXCycle4()
+    private ushort RraZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort RraZeropageXCycle3()
+    private ushort RraZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort RraZeropageXCycle2()
+    private ushort RraZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort RraZeropageXCycle1()
+    private ushort RraZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort RraIndirectXCycle8()
+    private ushort RraIndirectXCycle8()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle7()
+    private ushort RraIndirectXCycle7()
     {
         return 0;
     }
 
-    protected ushort RraIndirectXCycle6()
+    private ushort RraIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle5()
+    private ushort RraIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle4()
+    private ushort RraIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle3()
+    private ushort RraIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle2()
+    private ushort RraIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort RraIndirectXCycle1()
+    private ushort RraIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort RraIndirectYCycle8()
+    private ushort RraIndirectYCycle8()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle7()
+    private ushort RraIndirectYCycle7()
     {
         return 0;
     }
 
-    protected ushort RraIndirectYCycle6()
+    private ushort RraIndirectYCycle6()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle5()
+    private ushort RraIndirectYCycle5()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle4()
+    private ushort RraIndirectYCycle4()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle3()
+    private ushort RraIndirectYCycle3()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle2()
+    private ushort RraIndirectYCycle2()
     {
         return 0;
     }
-    protected ushort RraIndirectYCycle1()
+    private ushort RraIndirectYCycle1()
     {
         return 0;
     }
 
-    protected ushort JmpAbsoluteCycle4()
+    private ushort JmpAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort JmpAbsoluteCycle3()
+    private ushort JmpAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort JmpAbsoluteCycle2()
+    private ushort JmpAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort JmpAbsoluteCycle1()
+    private ushort JmpAbsoluteCycle1()
     {
         return 0;
     }
 
-    protected ushort JmpIndirectCycle5()
+    private ushort JmpIndirectCycle5()
     {
         return 0;
     }
-    protected ushort JmpIndirectCycle4()
+    private ushort JmpIndirectCycle4()
     {
         return 0;
     }
-    protected ushort JmpIndirectCycle3()
+    private ushort JmpIndirectCycle3()
     {
         return 0;
     }
-    protected ushort JmpIndirectCycle2()
+    private ushort JmpIndirectCycle2()
     {
         return 0;
     }
-    protected ushort JmpIndirectCycle1()
+    private ushort JmpIndirectCycle1()
     {
         return 0;
     }
 
-    protected ushort SaxAbsoluteCycle4()
+    private ushort SaxAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort SaxAbsoluteCycle3()
+    private ushort SaxAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort SaxAbsoluteCycle2()
+    private ushort SaxAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort SaxAbsoluteCycle1()
+    private ushort SaxAbsoluteCycle1()
     {
         return 0;
     }
-
 
-    protected ushort SaxZeropageCycle3()
-    {
-        return 0;
-    }
-    protected ushort SaxZeropageCycle2()
-    {
-        return 0;
-    }
-    protected ushort SaxZeropageCycle1()
-    {
-        return 0;
-    }
 
-    protected ushort SaxZeropageYCycle6()
-    {
-        return 0;
-    }
-    protected ushort SaxZeropageYCycle5()
-    {
-        return 0;
-    }
-    protected ushort SaxZeropageYCycle4()
-    {
-        return 0;
-    }
-    protected ushort SaxZeropageYCycle3()
+    private ushort SaxZeropageCycle3()
     {
         return 0;
     }
-    protected ushort SaxZeropageYCycle2()
+    private ushort SaxZeropageCycle2()
     {
         return 0;
     }
-    protected ushort SaxZeropageYCycle1()
+    private ushort SaxZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort SaxIndirectXCycle6()
-    {
-        return 0;
-    }
-    protected ushort SaxIndirectXCycle5()
+    private ushort SaxZeropageYCycle6()
     {
         return 0;
     }
-    protected ushort SaxIndirectXCycle4()
+    private ushort SaxZeropageYCycle5()
     {
         return 0;
     }
-    protected ushort SaxIndirectXCycle3()
+    private ushort SaxZeropageYCycle4()
     {
         return 0;
     }
-    protected ushort SaxIndirectXCycle2()
+    private ushort SaxZeropageYCycle3()
     {
         return 0;
     }
-    protected ushort SaxIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    protected ushort SaxIndirectYCycle8()
+    private ushort SaxZeropageYCycle2()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle7()
+    private ushort SaxZeropageYCycle1()
     {
         return 0;
     }
 
-    protected ushort SaxIndirectYCycle6()
+    private ushort SaxIndirectXCycle6()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle5()
+    private ushort SaxIndirectXCycle5()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle4()
+    private ushort SaxIndirectXCycle4()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle3()
+    private ushort SaxIndirectXCycle3()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle2()
+    private ushort SaxIndirectXCycle2()
     {
         return 0;
     }
-    protected ushort SaxIndirectYCycle1()
+    private ushort SaxIndirectXCycle1()
     {
         return 0;
     }
 
-    protected ushort StxZeropageCycle3()
+    private ushort StxZeropageCycle3()
     {
         return 0;
     }
-    protected ushort StxZeropageCycle2()
+    private ushort StxZeropageCycle2()
     {
         return 0;
     }
-    protected ushort StxZeropageCycle1()
+    private ushort StxZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort StxZeropageYCycle4()
+    private ushort StxZeropageYCycle4()
     {
         return 0;
     }
-    protected ushort StxZeropageYCycle3()
+    private ushort StxZeropageYCycle3()
     {
         return 0;
     }
-    protected ushort StxZeropageYCycle2()
+    private ushort StxZeropageYCycle2()
     {
         return 0;
     }
-    protected ushort StxZeropageYCycle1()
+    private ushort StxZeropageYCycle1()
     {
         return 0;
     }
 
-    protected ushort StxAbsoluteCycle4()
+    private ushort StxAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort StxAbsoluteCycle3()
+    private ushort StxAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort StxAbsoluteCycle2()
+    private ushort StxAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort StxAbsoluteCycle1()
+    private ushort StxAbsoluteCycle1()
     {
         return 0;
     }
 
     // DEC
-    protected ushort DecZeropageCycle5()
+    private ushort DecZeropageCycle5()
     {
         return 0;
     }
-    protected ushort DecZeropageCycle4()
+    private ushort DecZeropageCycle4()
     {
         return 0;
     }
-    protected ushort DecZeropageCycle3()
+    private ushort DecZeropageCycle3()
     {
         return 0;
     }
-    protected ushort DecZeropageCycle2()
+    private ushort DecZeropageCycle2()
     {
         return 0;
     }
-    protected ushort DecZeropageCycle1()
-    {
-        return 0;
-    }
-
-
-    protected ushort DecZeropageXCycle6()
-    {
-        return 0;
-    }
-    protected ushort DecZeropageXCycle5()
-    {
-        return 0;
-    }
-    protected ushort DecZeropageXCycle4()
-    {
-        return 0;
-    }
-    protected ushort DecZeropageXCycle3()
-    {
-        return 0;
-    }
-    protected ushort DecZeropageXCycle2()
-    {
-        return 0;
-    }
-    protected ushort DecZeropageXCycle1()
+    private ushort DecZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort DecAbsoluteCycle6()
+
+    private ushort DecZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort DecAbsoluteCycle5()
+    private ushort DecZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort DecAbsoluteCycle4()
+    private ushort DecZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort DecAbsoluteCycle3()
+    private ushort DecZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort DecAbsoluteCycle2()
+    private ushort DecZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort DecAbsoluteCycle1()
+    private ushort DecZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort DecAbsoluteXCycle7()
+    private ushort DecAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle6()
+    private ushort DecAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle5()
+    private ushort DecAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle4()
+    private ushort DecAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle3()
+    private ushort DecAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle2()
+    private ushort DecAbsoluteCycle1()
     {
         return 0;
     }
-    protected ushort DecAbsoluteXCycle1()
+
+    private ushort DecAbsoluteXCycle7()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle6()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle5()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle4()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle3()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle2()
+    {
+        return 0;
+    }
+    private ushort DecAbsoluteXCycle1()
     {
         return 0;
     }
 
     // INC
-    protected ushort IncZeropageCycle5()
+    private ushort IncZeropageCycle5()
     {
         return 0;
     }
-    protected ushort IncZeropageCycle4()
+    private ushort IncZeropageCycle4()
     {
         return 0;
     }
-    protected ushort IncZeropageCycle3()
+    private ushort IncZeropageCycle3()
     {
         return 0;
     }
-    protected ushort IncZeropageCycle2()
+    private ushort IncZeropageCycle2()
     {
         return 0;
     }
-    protected ushort IncZeropageCycle1()
-    {
-        return 0;
-    }
-
-
-    protected ushort IncZeropageXCycle6()
-    {
-        return 0;
-    }
-    protected ushort IncZeropageXCycle5()
-    {
-        return 0;
-    }
-    protected ushort IncZeropageXCycle4()
-    {
-        return 0;
-    }
-    protected ushort IncZeropageXCycle3()
-    {
-        return 0;
-    }
-    protected ushort IncZeropageXCycle2()
-    {
-        return 0;
-    }
-    protected ushort IncZeropageXCycle1()
+    private ushort IncZeropageCycle1()
     {
         return 0;
     }
 
-    protected ushort IncAbsoluteCycle6()
+
+    private ushort IncZeropageXCycle6()
     {
         return 0;
     }
-    protected ushort IncAbsoluteCycle5()
+    private ushort IncZeropageXCycle5()
     {
         return 0;
     }
-    protected ushort IncAbsoluteCycle4()
+    private ushort IncZeropageXCycle4()
     {
         return 0;
     }
-    protected ushort IncAbsoluteCycle3()
+    private ushort IncZeropageXCycle3()
     {
         return 0;
     }
-    protected ushort IncAbsoluteCycle2()
+    private ushort IncZeropageXCycle2()
     {
         return 0;
     }
-    protected ushort IncAbsoluteCycle1()
+    private ushort IncZeropageXCycle1()
     {
         return 0;
     }
 
-    protected ushort IncAbsoluteXCycle7()
+    private ushort IncAbsoluteCycle6()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle6()
+    private ushort IncAbsoluteCycle5()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle5()
+    private ushort IncAbsoluteCycle4()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle4()
+    private ushort IncAbsoluteCycle3()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle3()
+    private ushort IncAbsoluteCycle2()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle2()
+    private ushort IncAbsoluteCycle1()
     {
         return 0;
     }
-    protected ushort IncAbsoluteXCycle1()
+
+    private ushort IncAbsoluteXCycle7()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle6()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle5()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle4()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle3()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle2()
+    {
+        return 0;
+    }
+    private ushort IncAbsoluteXCycle1()
     {
         return 0;
     }
