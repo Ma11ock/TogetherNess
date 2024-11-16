@@ -3,14 +3,27 @@ using TogetherNess.Utils;
 
 namespace TogetherNess.Hardware;
 
-public class Mos6502
+public class Mos6502(in IMemory memory)
 {
+    /// <summary>
+    /// Memory system.
+    /// </summary>
+    private readonly IMemory _memory = memory;
+    
+    /// <summary>
+    /// The current clock cycle in the instruction.
+    /// </summary>
     private int CurrentInstructionStep { get; set; } = 0;
     
     /// <summary>
     /// Effective Address.
     /// </summary>
     public ushort EffectiveAddress { get; set; } = 0;
+    
+    /// <summary>
+    /// Program Counter.
+    /// </summary>
+    public ushort ProgramCounter { get; set; } = 0;
     
     /// <summary>
     /// Accumulator.
@@ -31,12 +44,6 @@ public class Mos6502
     /// Stack pointer.
     /// </summary>
     public byte StackPointer { get; set; } = 0;
-
-    /// <summary>
-    /// Program Counter.
-    /// </summary>
-    public byte ProgramCounter { get; set; } = 0;
-
     /// <summary>
     /// Status register (only 6 bits are used by the ALU).
     /// </summary>
@@ -90,21 +97,6 @@ public class Mos6502
         set => Status.SetBitValue(5, value);
     }
 
-    public Mos6502()
-    {
-    }
-    
-    public int CpuAdd(int a, int b, bool addCarryBit = false)
-    {
-        int result = a + b + (addCarryBit && CarryBit ? 1 : 0);
-        
-        CarryBit = result > 0xFF;
-        OverflowBit = ((result ^ a) & (result ^ b) & 0x80) != 0;
-        ZeroBit = result == 0;
-        NegativeBit = (result & 0x80) != 0; // Negative bit is the MSb.
-        return result;
-    }
-
     public void Tick()
     {
         if (CurrentInstructionStep != 0)
@@ -120,9 +112,22 @@ public class Mos6502
         }
         
         // No current instruction. Decode the next instruction.
-        EffectiveAddress = ProgramCounter++;
-        //CurrentInstruction = memoryAccessor[EffectiveAddress];
+        CurrentInstruction = LoadNextOpcodeByte();
     }
+    
+    private void CpuAdd(int b)
+    {
+        int a = Accumulator;
+        int result = a + b + (CarryBit ? 1 : 0);
+        
+        CarryBit = result > 0xFF;
+        OverflowBit = ((result ^ a) & (result ^ b) & 0x80) != 0;
+        ZeroBit = result == 0;
+        NegativeBit = (result & 0x80) != 0; // Negative bit is the MSb.
+        Accumulator = (byte)result;
+    }
+
+    private byte LoadNextOpcodeByte() => DataLatch = (byte)_memory[ProgramCounter++];
     
     private ushort CpuTick() 
         => CurrentInstruction switch 
@@ -4769,11 +4774,13 @@ public class Mos6502
 
     private ushort SbcImmCycle2()
     {
+        CpuAdd(-(sbyte)DataLatch);
         return 0;
     }
     private ushort SbcImmCycle1()
     {
-        return 0;
+        LoadNextOpcodeByte();
+        return 2;
     }
 
     private ushort SbcZeropageCycle3()
@@ -4850,19 +4857,22 @@ public class Mos6502
     }
     private ushort SbcAbsoluteYCycle4()
     {
-        return 0;
+        return 5;
     }
     private ushort SbcAbsoluteYCycle3()
     {
-        return 0;
+        return 4;
     }
     private ushort SbcAbsoluteYCycle2()
     {
-        return 0;
+        EffectiveAddress |= (ushort)(LoadNextOpcodeByte() << 8);
+        return 3;
     }
     private ushort SbcAbsoluteYCycle1()
     {
-        return 0;
+        EffectiveAddress = 0;
+        EffectiveAddress |= LoadNextOpcodeByte();
+        return 2;
     }
 
     private ushort SbcIndirectXCycle6()
@@ -5075,11 +5085,13 @@ public class Mos6502
 
     private ushort AdcImmCycle2()
     {
+        CpuAdd(DataLatch);
         return 0;
     }
     private ushort AdcImmCycle1()
     {
-        return 1;
+        LoadNextOpcodeByte();
+        return 2;
     }
 
     private ushort AdcZeropageCycle3()
