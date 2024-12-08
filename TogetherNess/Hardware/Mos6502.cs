@@ -1,24 +1,81 @@
 using System;
+using System.Diagnostics;
 using TogetherNess.Utils;
 
 namespace TogetherNess.Hardware;
 
+// Questions: Does the CPU pipeline, i.e. does it read the next instruction if the memory bus is being otherwise unused.
+
 public class Mos6502(in IMemory memory)
 {
+    private enum DestinationRegister
+    {
+        IndexX,
+        IndexY,
+        Accumulator,
+        StackPointer,
+    }
+    
+    private const Timing FIRST_CYCLE = Timing.T2;
+    
+    private const Timing TWO_CYCLE_FIRST_TIMING = Timing.T0 | Timing.T2;
+    
+    private const Timing LAST_CYCLE_TIMING = Timing.TPlus | Timing.T1;
+    
     /// <summary>
     /// Memory system.
     /// </summary>
     private readonly IMemory _memory = memory;
     
     /// <summary>
-    /// The current clock cycle in the instruction.
+    /// Is true if the CPU is executing an instruction, false if the CPU is in between instructions.
     /// </summary>
-    private int CurrentInstructionStep { get; set; } = 0;
+    public bool IsInMiddleOfInstruction => (InstructionTimer & FIRST_CYCLE) != FIRST_CYCLE; 
+
+    /// <summary>
+    /// Destination of the current memory read operation.
+    /// </summary>
+    public MemoryDataDestination MemoryDataDestination { get; set; } = MemoryDataDestination.InstructionRegister;
     
     /// <summary>
-    /// Effective Address.
+    /// The current clock cycle in the instruction.
     /// </summary>
-    public ushort EffectiveAddress { get; set; } = 0;
+    public Timing InstructionTimer { get; set; } = Timing.T2 | Timing.TPlus;
+    
+    /// <summary>
+    /// Temporary latch used to calculate memory addresses.
+    /// </summary>
+    public ushort DataPointer { get; set; } = 0;
+
+    public byte DataPointerLow
+    {
+        get => (byte)DataPointer;
+        set => DataPointer = (ushort)((DataPointer & 0xFF00) | value);
+    }
+    
+    public byte DataPointerHigh
+    {
+        get => (byte)(DataPointer >> 8);
+        set => DataPointer = (ushort)((DataPointer & 0x00FF) | (value << 8));
+    }
+    
+    /// <summary>
+    /// Effective Address. Contains the memory address that the current cycle's memory operation
+    /// will be done on.
+    /// </summary>
+    public ushort MemoryAddressRegister { get; set; } = 0;
+    
+    public byte MemoryAddressLow
+    {
+        get => (byte)MemoryAddressRegister;
+        set => MemoryAddressRegister = (ushort)((MemoryAddressRegister & 0xFF00) | value);
+    }
+    
+    public byte MemoryAddressHigh
+    {
+        get => (byte)(MemoryAddressRegister >> 8);
+        set => MemoryAddressRegister = (ushort)((MemoryAddressRegister & 0x00FF) | (value << 8));
+    }
     
     /// <summary>
     /// Program Counter.
@@ -28,7 +85,7 @@ public class Mos6502(in IMemory memory)
     /// <summary>
     /// Accumulator.
     /// </summary>
-    public byte Accumulator { get; set; } = 0;
+    public byte Accumulator { get; set; } = 0xAA;
 
     /// <summary>
     /// X index register.
@@ -44,6 +101,7 @@ public class Mos6502(in IMemory memory)
     /// Stack pointer.
     /// </summary>
     public byte StackPointer { get; set; } = 0;
+    
     /// <summary>
     /// Status register (only 6 bits are used by the ALU).
     /// </summary>
@@ -52,14 +110,35 @@ public class Mos6502(in IMemory memory)
     /// <summary>
     /// Input data latch from memory.
     /// </summary>
-    public byte DataLatch { get; set; } = 0;
+    public byte MemoryDataRegister { get; set; } = 0;
+    
+    /// <summary>
+    /// Output register for memory.
+    /// </summary>
+    public byte MemoryDataOutputRegister { get; set; } = 0;
+    
+    /// <summary>
+    /// Register that contains the current executing instruction.
+    /// </summary>
+    public byte InstructionRegister { get; set; } = 0x00;
+    
+    /// <summary>
+    /// Register used for internal operations.
+    /// </summary>
+    public byte TempRegister { get; set; } = 0x00;
 
     /// <summary>
-    /// True if the CPU is reading.
+    /// If true signals a memory read. If false then a memory write.
     /// </summary>
     public bool ReadPin { get; set; } = false;
-    
-    private byte CurrentInstruction { get; set; } = 0;
+
+    /// <summary>
+    /// True if the last ALU operation resulted in a carry bit, false if not.
+    /// <see cref="CarryOut"/> is different from <see cref="CarryBit"/> because <see cref="CarryBit"/> is part of the
+    /// status register and can be used by the programmer. <see cref="CarryOut"/> is used only for internal CPU
+    /// operations.
+    /// </summary>
+    public bool CarryOut { get; set; } = false;
 
     public bool NegativeBit
     {
@@ -97,6707 +176,6682 @@ public class Mos6502(in IMemory memory)
         set => Status.SetBitValue(5, value);
     }
 
-    public void Tick()
+    public void Cycle()
     {
-        if (CurrentInstructionStep != 0)
-        {
-            // In the middle of an instruction. Perform read and do the next step.
-            CurrentInstructionStep = CpuTick();
-            if (CurrentInstructionStep == 0)
-            {
-                CurrentInstruction++;
-            }
+        // Address latch is PC by default. This is essentially φ1 of the 6502's cycle.
+        MemoryAddressRegister = ProgramCounter;
+        ReadPin = true;
+        
+        // φ2 of the 6502's cycle.
+        // Perform memory operation and perform next step of the current instruction.
 
-            return;
+        {
+            // We only want the bottom 5 bits, excluding T0. No SD1, T6, T1, etc..
+            int regularTiming = ((int)InstructionTimer >> 1) & 0x1F;
+            // Assert that only one of TPlus-T5 is HIGH.
+            Debug.Assert((regularTiming & (regularTiming - 1)) == 0);
+        }
+        // MOS 6502 opcodes are made up of three parts: aaabbbcc
+        // aaa: Type (e.g. sbc, adc, ror, etc.)
+        // bbb: Address mode (e.g. implied, immediate, absolute X, etc).
+        // cc: Clarifying type.
+        // See: https://llx.com/Neil/a2/opcodes.html
+        int bbb = (InstructionRegister >> 2) & 0x7; // Instruction address mode.
+        int cc = InstructionRegister & 0x03; // Instruction subtype.
+        bool twoCycleInstruction = (bbb == 0x2 && cc == 0x1) ||
+                                   (bbb == 0x0 && cc is 0x3 or 0x0) ||
+                                   InstructionRegister == 0x18 ||
+                                   InstructionRegister == 0x38 ||
+                                   InstructionRegister == 0x58 ||
+                                   InstructionRegister == 0x78 ||
+                                   InstructionRegister == 0xB8 ||
+                                   InstructionRegister == 0xD8 ||
+                                   InstructionRegister == 0xF8 ||
+                                   InstructionRegister == 0xEA;
+        
+        bool instructionFetch = (InstructionTimer | Timing.T1) == Timing.T1;
+        Timing nextTiming = InstructionDecodeAndRun(InstructionTimer);
+        
+        if (instructionFetch)
+        {
+            // Address latch is the next opcode or instruction operand.
+            MemoryDataDestination = MemoryDataDestination.InstructionRegister;
+            SetupReadFor(ProgramCounter);
         }
         
         // No current instruction. Decode the next instruction.
-        CurrentInstruction = LoadNextOpcodeByte();
+        if (ReadPin)
+        {
+            // Data read.
+            MemoryDataRegister = (byte)_memory[MemoryAddressRegister];
+        }
+        else
+        {
+            // Data write.
+            _memory[MemoryAddressRegister] = MemoryDataRegister;
+        }
+
+        switch (MemoryDataDestination)
+        {
+            case MemoryDataDestination.InstructionRegister:
+                InstructionRegister = MemoryDataRegister;
+                // Predecode: Determine if the instruction is 1 byte.
+                // This is done for accuracy with interrupts. Interrupts only trigger if the T0 on an instruction
+                // was set, but branches not taken do not set the T0 until the next instruction, causing a delay.
+                // We need to emulate T0 behavior to achieve that delay.
+                bool oneByteInstruction = (InstructionRegister & 0x08) == 0x08 ||
+                                          (InstructionRegister & 0x0A) == 0x0A ||
+                                          InstructionRegister == 0x40 ||
+                                          InstructionRegister == 0x60;
+
+            
+                InstructionTimer |= nextTiming == Timing.T2 && oneByteInstruction ? Timing.T0 : 0;
+                break;
+            case MemoryDataDestination.DataPointerLow:
+                DataPointerLow = MemoryDataRegister;
+                break;
+            case MemoryDataDestination.DataPointerHigh:
+                DataPointerHigh = MemoryDataRegister;
+                break;
+        }
+
+        ProgramCounter += (ushort)(!twoCycleInstruction
+                                   || (InstructionTimer | Timing.T1) == Timing.T1  ? 1 : 0);
+        
+        InstructionTimer = nextTiming;
     }
     
-    private void CpuAdd(int b)
+    /// <summary>
+    /// Perform an ALU addition operation on a, b, and the carry bit.
+    /// </summary>
+    /// <param name="a">The operator for addition. ALU's a register.</param>
+    /// <param name="b">The other operator for addition. ALU's b register.</param>
+    /// <param name="carry">The carry bit.</param>
+    /// <returns>(In order) The addition's result, the negative bit, the zero bit, the carry bit, the overflow bit.</returns>
+    public (byte, bool, bool, bool, bool) AluAdd(int a, int b, bool carry)
     {
-        int a = Accumulator;
-        int result = a + b + (CarryBit ? 1 : 0);
-        
-        CarryBit = result > 0xFF;
-        OverflowBit = ((result ^ a) & (result ^ b) & 0x80) != 0;
-        ZeroBit = result == 0;
-        NegativeBit = (result & 0x80) != 0; // Negative bit is the MSb.
-        Accumulator = (byte)result;
+        int result = a + b + (carry ? 1 : 0);
+        return ((byte)result,
+            (result & 0x80) != 0,
+            result == 0,
+            result > 0xFF,
+            ((result ^ a) & (result ^ b) & 0x80) != 0);
     }
 
-    private byte LoadNextOpcodeByte() => DataLatch = (byte)_memory[ProgramCounter++];
+    /// <summary>
+    /// Perform a logical right shift on a and return the result and the status register states.
+    /// </summary>
+    /// <param name="a">The value to logical shift right.</param>
+    /// <returns>(In order) The result of the shift, the negative bit, the zero bit, and the carry bit.</returns>
+    public (byte, bool, bool, bool) AluLogicalShiftRight(int a)
+    {
+        uint result = (uint)a >> 1;
+        return ((byte)result, false, result == 0, (result & 1) == 1);
+    }
     
-    private ushort CpuTick() 
-        => CurrentInstruction switch 
+    public (byte, bool, bool) AluOr(int a, int b)
+    {
+        int result = a | b;
+        return ((byte)result, 
+            result == 0,
+            (result & 0x80) != 0);
+    }
+    
+    public (byte, bool, bool) AluAnd(int a, int b)
+    {
+        int result = a & b;
+        return ((byte)result, 
+            result == 0,
+            (result & 0x80) != 0);
+    }
+
+    public (byte, bool, bool, bool) AluAsl(int a)
+    {
+        int result = a << 1;
+        return ((byte)result, (a & 0x80) != 0, result == 0, (result & 0x80) != 0);
+    }
+
+    public (byte, bool, bool, bool) AluRotateLeft(int a)
+    {
+        int result = (byte)(a << 1) | (byte)(a >> (8 - 1));
+        return ((byte)result, (result & 0x80) == 0x80, result == 0, (a & 0x80) == 0x80);
+    }
+    
+    private void SetupReadFor(ushort address)
+    {
+        MemoryAddressRegister = address;
+        ReadPin = true;
+    }
+
+    /// <summary>
+    /// Perform an ALU addition operation on b and the <see cref="Accumulator"/> and store the result in
+    /// the <see cref="Accumulator"/> and the status registers.
+    /// Micro operations:
+    /// A ← A + b + C
+    /// N ← A gt 0
+    /// Z ← A = 0
+    /// C ← 1 if there was unsigned integer overflow, otherwise 0
+    /// V ← 1 if there was signed integer overflow, otherwise 0
+    /// </summary>
+    /// <param name="b">The other operator for addition. ALU's b register.</param>
+    /// <returns><see cref="Timing.T2"/>, as this is always the last operation in an instruction.</returns>
+    private Timing LogicAdd(int b)
+    {
+        var (result, negative, zero, carry, overflow) = AluAdd(Accumulator, b, CarryBit);
+        Accumulator = result;
+        CarryBit = carry;
+        OverflowBit = overflow;
+        ZeroBit = zero;
+        NegativeBit = negative;
+        return Timing.T2;
+    }
+
+    /// <summary>
+    /// Perform an ALU addition operation on the <see cref="Accumulator"/> and the 2's complement of b
+    /// and store the result in the <see cref="Accumulator"/> and the status registers.
+    /// Micro operations:
+    /// A ← A - b + C
+    /// N ← A gt 0
+    /// Z ← A = 0
+    /// C ← 1 if there was unsigned integer overflow, otherwise 0
+    /// V ← 1 if there was signed integer overflow, otherwise 0
+    /// </summary>
+    /// <param name="b">The other operator for addition. ALU's b register.</param>
+    /// <returns><see cref="Timing.T2"/>, as this is always the last operation in an instruction.</returns>
+    private Timing LogicSubtract(int b) => LogicAdd(-b);
+
+    private Timing LogicCompare(int a, int b)
+    {
+        var (_, negative, zero, carry, _) = AluAdd(a, -b, false);
+        CarryBit = carry;
+        ZeroBit = zero;
+        NegativeBit = negative;
+        return Timing.T2;
+    }
+
+    public Timing LogicAnd(int a)
+    {
+        var (result, negative, zero) = AluAnd(Accumulator, a);
+        Accumulator = result;
+        NegativeBit = negative;
+        ZeroBit = zero;
+        return Timing.T2;
+    }
+    
+    private Timing InstructionDecodeAndRun(Timing instructionTimer) 
+        => InstructionRegister switch 
         {
             // BRK.
-            0x0 => CurrentInstructionStep switch
+            0x0 => instructionTimer switch
             {
-                1 => BrkCycle1(),
-                2 => BrkCycle2(),
-                3 => BrkCycle3(),
-                4 => BrkCycle4(),
-                5 => BrkCycle5(),
-                6 => BrkCycle6(),
-                7 => BrkCycle7(),
+               Timing.T2 => BrkCycle1(),
+               Timing.T3 => BrkCycle2(),
+               Timing.T4 => BrkCycle3(),
+               Timing.T5 => BrkCycle4(),
+               Timing.T6 =>BrkCycle5(),
+               Timing.T0 => BrkCycle6(),
+               Timing.TPlus => BrkCycle7(),
                 _ => throw new InvalidInstructionStepException(0x0)
             },
             // ORA indirect, X.
-            0x1 => CurrentInstructionStep switch
+            0x1 => instructionTimer switch
             {
-                1 => OraIndirectXCycle1(),
-                2 => OraIndirectXCycle2(),
-                3 => OraIndirectXCycle3(),
-                4 => OraIndirectXCycle4(),
-                5 => OraIndirectXCycle5(),
-                6 => OraIndirectXCycle6(),
+               Timing.T2 => OraIndirectXCycle1(),
+               Timing.T3 =>OraIndirectXCycle2(),
+               Timing.T4 => OraIndirectXCycle3(),
+               Timing.T5 => OraIndirectXCycle4(),
+               Timing.T0 => OraIndirectXCycle5(),
+               Timing.TPlus => OraIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x1)
             },
             // Jam (illegal)
             0x2 => Jam(),
             // SLO indirect, X (illegal)
-            0x3 => CurrentInstructionStep switch
+            0x3 => instructionTimer switch
             {
-                1 => SloIndirectXCycle1(),
-                2 => SloIndirectXCycle2(),
-                3 => SloIndirectXCycle3(),
-                4 => SloIndirectXCycle4(),
-                5 => SloIndirectXCycle5(),
-                6 => SloIndirectXCycle6(),
-                7 => SloIndirectXCycle7(),
-                8 => SloIndirectXCycle8(),
+               Timing.T2 => SloIndirectXCycle1(),
+               Timing.T3 =>SloIndirectXCycle2(),
+               Timing.T4 => SloIndirectXCycle3(),
+               Timing.T5 => SloIndirectXCycle4(),
+               Timing.T6 =>SloIndirectXCycle5(),
+               Timing.T0 => SloIndirectXCycle6(),
+               Timing.TPlus => SloIndirectXCycle7(),
+               Timing.T8 => SloIndirectXCycle8(),
                 _ => throw new InvalidInstructionStepException(0x3)
             },
             // NOP zeropage (illegal)
-            0x4 => CurrentInstructionStep switch
+            0x4 => instructionTimer switch
             {
-                1 => NopZeropageCycle1(),
-                2 => NopZeropageCycle2(),
-                3 => NopZeropageCycle3(),
+               Timing.T2 => NopZeropageCycle1(),
+               Timing.T3 =>NopZeropageCycle2(),
+               Timing.T4 => NopZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x4)
             },
             // ORA zeropage
-            0x5 => CurrentInstructionStep switch
+            0x5 => instructionTimer switch
             {
-                1 => OraZeropageCycle1(),
-                2 => OraZeropageCycle2(),
-                3 => OraZeropageCycle3(),
+               Timing.T2 => OraZeropageCycle1(),
+               Timing.T3 =>OraZeropageCycle2(),
+               Timing.T4 => OraZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x5)
             },
             // ASL zeropage
-            0x6 => CurrentInstructionStep switch
+            0x6 => instructionTimer switch
             {
-                1 => AslZeropageCycle1(),
-                2 => AslZeropageCycle2(),
-                3 => AslZeropageCycle3(),
-                4 => AslZeropageCycle4(),
-                5 => AslZeropageCycle5(),
+               Timing.T2 => AslZeropageCycle1(),
+               Timing.T3 =>AslZeropageCycle2(),
+               Timing.T4 => AslZeropageCycle3(),
+               Timing.T5 => AslZeropageCycle4(),
+               Timing.T6 =>AslZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0x6)
             },
             // SLO zeropage
-            0x7 => CurrentInstructionStep switch
+            0x7 => instructionTimer switch
             {
-                1 => SloZeropageCycle1(),
-                2 => SloZeropageCycle2(),
-                3 => SloZeropageCycle3(),
-                4 => SloZeropageCycle4(),
-                5 => SloZeropageCycle5(),
+               Timing.T2 => SloZeropageCycle1(),
+               Timing.T3 =>SloZeropageCycle2(),
+               Timing.T4 => SloZeropageCycle3(),
+               Timing.T5 => SloZeropageCycle4(),
+               Timing.T6 =>SloZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0x7)
             },
             // PHP zeropage
-            0x8 => CurrentInstructionStep switch
+            0x8 => instructionTimer switch
             {
-                1 => PhpCycle1(),
-                2 => PhpCycle2(),
-                3 => PhpCycle3(),
+               Timing.T2 => PhpCycle1(),
+               Timing.T3 =>PhpCycle2(),
+               Timing.T4 => PhpCycle3(),
                 _ => throw new InvalidInstructionStepException(0x8)
             },
             // ORA imm
-            0x9 => CurrentInstructionStep switch
+            0x9 => instructionTimer switch
             {
-                1 => OraImmCycle1(),
-                2 => OraImmCycle2(),
+               Timing.T2 | Timing.T0 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => OraLastCycle(),
                 _ => throw new InvalidInstructionStepException(0x9)
             },
             // ASL accum
-            0xA => CurrentInstructionStep switch
+            0xA => instructionTimer switch
             {
-                1 => AslAccumCycle1(),
-                2 => AslAccumCycle2(),
+               Timing.T2 => AslAccumCycle1(),
+               Timing.T3 =>AslAccumCycle2(),
                 _ => throw new InvalidInstructionStepException(0xA)
             },
             // ANC imm (illegal)
-            0xB => CurrentInstructionStep switch
+            0xB => instructionTimer switch
             {
-                1 => AncCycle1(),
-                2 => AncCycle2(),
-                3 => AncCycle3(),
+               Timing.T2 => AncCycle1(),
+               Timing.T3 =>AncCycle2(),
+               Timing.T4 => AncCycle3(),
                 _ => throw new InvalidInstructionStepException(0xB)
             },
             // Nop abs (illegal)
-            0xC => CurrentInstructionStep switch
+            0xC => instructionTimer switch
             {
-                1 => NopAbsoluteCycle1(),
-                2 => NopAbsoluteCycle2(),
-                3 => NopAbsoluteCycle3(),
-                4 => NopAbsoluteCycle4(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(Timing.T0),
+               Timing.T0 => AbsoluteCycle3(Timing.TPlus | Timing.T0),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xC)
             },
             // Ora abs
-            0xD => CurrentInstructionStep switch
+            0xD => instructionTimer switch
             {
-                1 => OraAbsoluteCycle1(),
-                2 => OraAbsoluteCycle2(),
-                3 => OraAbsoluteCycle3(),
-                4 => OraAbsoluteCycle4(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(Timing.T0),
+               Timing.T0 => AbsoluteCycle3(Timing.TPlus | Timing.T1),
+               Timing.TPlus | Timing.T1 => OraLastCycle(),
                 _ => throw new InvalidInstructionStepException(0xD)
             },
             // ASL abs
-            0xE => CurrentInstructionStep switch
+            0xE => instructionTimer switch
             {
-                1 => AslAbsoluteCycle1(),
-                2 => AslAbsoluteCycle2(),
-                3 => AslAbsoluteCycle3(),
-                4 => AslAbsoluteCycle4(),
-                5 => AslAbsoluteCycle5(),
-                6 => AslAbsoluteCycle6(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 | Timing.SD1 => AbsoluteCycle3(),
+               Timing.T5 | Timing.SD2 => AslAbsoluteCycle4(),
+               Timing.T0 => Write(DataPointer, TempRegister),
+               Timing.TPlus | Timing.T1 => FIRST_CYCLE,
                 _ => throw new InvalidInstructionStepException(0xE)
             },
             // SLO abs
-            0xF => CurrentInstructionStep switch
+            0xF => instructionTimer switch
             {
-                1 => SloAbsoluteCycle1(),
-                2 => SloAbsoluteCycle2(),
-                3 => SloAbsoluteCycle3(),
-                4 => SloAbsoluteCycle4(),
-                5 => SloAbsoluteCycle5(),
-                6 => SloAbsoluteCycle6(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 | Timing.SD1 => AbsoluteCycle3(),
+               Timing.T5 | Timing.SD2 => SloAbsoluteCycle5(),
+               Timing.T6 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => FIRST_CYCLE,
                 _ => throw new InvalidInstructionStepException(0xF)
             },
             // BPL
-            0x10 => CurrentInstructionStep switch
+            0x10 => instructionTimer switch
             {
-                1 => BplCycle1(),
-                2 => BplCycle2(),
-                3 => BplCycle3(),
-                4 => BplCycle4(),
+               Timing.T2 => BplCycle1(),
+               Timing.T3 => BplCycle2(),
+               Timing.T4 => BplCycle3(),
+               Timing.T5 => BplCycle4(),
                 _ => throw new InvalidInstructionStepException(0x11)
             },
             // ORA indirect, Y
-            0x11 => CurrentInstructionStep switch
+            0x11 => instructionTimer switch
             {
-                1 => OraIndirectYCycle1(),
-                2 => OraIndirectYCycle2(),
-                3 => OraIndirectYCycle3(),
-                4 => OraIndirectYCycle4(),
-                5 => OraIndirectYCycle5(),
-                6 => OraIndirectYCycle6(),
+               Timing.T2 => OraIndirectYCycle1(),
+               Timing.T3 =>OraIndirectYCycle2(),
+               Timing.T4 => OraIndirectYCycle3(),
+               Timing.T5 => OraIndirectYCycle4(),
+               Timing.T6 =>OraIndirectYCycle5(),
+               Timing.T0 => OraIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0x12)
             },
             // JAM (illegal)
             0x12 => Jam(),
             // 0x13 SLO indirect, Y
-            0x13 => CurrentInstructionStep switch
+            0x13 => instructionTimer switch
             {
-                1 => SloIndirectYCycle1(),
-                2 => SloIndirectYCycle2(),
-                3 => SloIndirectYCycle3(),
-                4 => SloIndirectYCycle4(),
-                5 => SloIndirectYCycle5(),
-                6 => SloIndirectYCycle6(),
-                7 => SloIndirectYCycle7(),
-                8 => SloIndirectYCycle8(),
+               Timing.T2 => SloIndirectYCycle1(),
+               Timing.T3 =>SloIndirectYCycle2(),
+               Timing.T4 => SloIndirectYCycle3(),
+               Timing.T5 => SloIndirectYCycle4(),
+               Timing.T6 =>SloIndirectYCycle5(),
+               Timing.T0 => SloIndirectYCycle6(),
+               Timing.TPlus => SloIndirectYCycle7(),
+               Timing.T8 => SloIndirectYCycle8(),
                 _ => throw new InvalidInstructionStepException(0x13)
             },       
             // 0x14 NOP zeropage, X (illegal)
-            0x14 => CurrentInstructionStep switch
+            0x14 => instructionTimer switch
             {
-                1 => NopZeropageCycle1(),
-                2 => NopZeropageCycle2(),
-                3 => NopZeropageCycle3(),
+               Timing.T2 => NopZeropageCycle1(),
+               Timing.T3 =>NopZeropageCycle2(),
+               Timing.T4 => NopZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x14)
             },       
             // 0x15 ORA zeropage, X
-            0x15 => CurrentInstructionStep switch
+            0x15 => instructionTimer switch
             {
-                1 => OraZeropageXCycle1(),
-                2 => OraZeropageXCycle2(),
-                3 => OraZeropageXCycle3(),
-                4 => OraZeropageXCycle4(),
+               Timing.T2 => OraZeropageXCycle1(),
+               Timing.T3 =>OraZeropageXCycle2(),
+               Timing.T4 => OraZeropageXCycle3(),
+               Timing.T5 => OraZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0x15)
             },       
             // 0x16 ASL zeropage, X
-            0x16 => CurrentInstructionStep switch
+            0x16 => instructionTimer switch
             {
-                1 => AslZeropageXCycle1(),
-                2 => AslZeropageXCycle2(),
-                3 => AslZeropageXCycle3(),
-                4 => AslZeropageXCycle4(),
-                5 => AslZeropageXCycle5(),
-                6 => AslZeropageXCycle6(),
+               Timing.T2 => AslZeropageXCycle1(),
+               Timing.T3 =>AslZeropageXCycle2(),
+               Timing.T4 => AslZeropageXCycle3(),
+               Timing.T5 => AslZeropageXCycle4(),
+               Timing.T6 =>AslZeropageXCycle5(),
+               Timing.T0 => AslZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x16)
             },       
             // 0x17 SLO zeropage
-            0x17 => CurrentInstructionStep switch
+            0x17 => instructionTimer switch
             {
-                1 => SloZeropageCycle1(),
-                2 => SloZeropageCycle2(),
-                3 => SloZeropageCycle3(),
-                4 => SloZeropageCycle4(),
-                5 => SloZeropageCycle5(),
+               Timing.T2 => SloZeropageCycle1(),
+               Timing.T3 =>SloZeropageCycle2(),
+               Timing.T4 => SloZeropageCycle3(),
+               Timing.T5 => SloZeropageCycle4(),
+               Timing.T6 =>SloZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0x17)
             },       
             // 0x18 Clc
-            0x18 => CurrentInstructionStep switch
+            0x18 => instructionTimer switch
             {
-                1 => ClcCycle1(),
-                2 => ClcCycle2(),
+               Timing.T2 => ClcCycle1(),
+               Timing.T3 =>ClcCycle2(),
                 _ => throw new InvalidInstructionStepException(0x18)
             },       
             // 0x19 ORA absolute, Y
-            0x19 => CurrentInstructionStep switch
+            0x19 => instructionTimer switch
             {
-                1 => OraAbsoluteYCycle1(),
-                2 => OraAbsoluteYCycle2(),
-                3 => OraAbsoluteYCycle3(),
-                4 => OraAbsoluteYCycle4(),
-                5 => OraAbsoluteYCycle5(),
+               Timing.T2 => OraAbsoluteYCycle1(),
+               Timing.T3 =>OraAbsoluteYCycle2(),
+               Timing.T4 => OraAbsoluteYCycle3(),
+               Timing.T5 => OraAbsoluteYCycle4(),
+               Timing.T6 =>OraAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x19)
             },       
             // 0x1A NOP implied (illegal)
-            0x1A => CurrentInstructionStep switch
+            0x1A => instructionTimer switch
             {
-                1 => NopImpliedCycle1(),
-                2 => NopImpliedCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T0,
+               Timing.TPlus | Timing.T0 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x1A)
             },       
-            // 0x1B NOP implied (illegal)
-            0x1B => CurrentInstructionStep switch
+            // 0x1B SLO abs, Y (illegal)
+            0x1B => instructionTimer switch
             {
-                1 => SloAbsoluteYCycle1(),
-                2 => SloAbsoluteYCycle2(),
-                3 => SloAbsoluteYCycle3(),
-                4 => SloAbsoluteYCycle4(),
-                5 => SloAbsoluteYCycle5(),
-                6 => SloAbsoluteYCycle6(),
-                7 => SloAbsoluteYCycle7(),
+               Timing.T2 => SloAbsoluteYCycle1(),
+               Timing.T3 =>SloAbsoluteYCycle2(),
+               Timing.T4 => SloAbsoluteYCycle3(),
+               Timing.T5 => SloAbsoluteYCycle4(),
+               Timing.T6 =>SloAbsoluteYCycle5(),
+               Timing.T0 => SloAbsoluteYCycle6(),
+               Timing.TPlus => SloAbsoluteYCycle7(),
                 _ => throw new InvalidInstructionStepException(0x1B)
             },       
             // 0x1C NOP abs, X (illegal)
-            0x1C => CurrentInstructionStep switch
+            0x1C => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(),
-                2 => NopAbsoluteXCycle2(),
-                3 => NopAbsoluteXCycle3(),
-                4 => NopAbsoluteXCycle4(),
-                5 => NopAbsoluteXCycle5(),
+               Timing.T2 => NopAbsoluteXCycle1(),
+               Timing.T3 =>NopAbsoluteXCycle2(),
+               Timing.T4 => NopAbsoluteXCycle3(),
+               Timing.T5 => NopAbsoluteXCycle4(),
+               Timing.T6 =>NopAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x1C)
             },       
             // 0x1D ORA abs, X
-            0x1D => CurrentInstructionStep switch
+            0x1D => instructionTimer switch
             {
-                1 => OraAbsoluteXCycle1(),
-                2 => OraAbsoluteXCycle2(),
-                3 => OraAbsoluteXCycle3(),
-                4 => OraAbsoluteXCycle4(),
-                5 => OraAbsoluteXCycle5(),
+               Timing.T2 => OraAbsoluteXCycle1(),
+               Timing.T3 =>OraAbsoluteXCycle2(),
+               Timing.T4 => OraAbsoluteXCycle3(),
+               Timing.T5 => OraAbsoluteXCycle4(),
+               Timing.T6 =>OraAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x1D)
             },       
             // 0x1E ASL abs, X
-            0x1E => CurrentInstructionStep switch
+            0x1E => instructionTimer switch
             {
-                1 => AslAbsoluteXCycle1(),
-                2 => AslAbsoluteXCycle2(),
-                3 => AslAbsoluteXCycle3(),
-                4 => AslAbsoluteXCycle4(),
-                5 => AslAbsoluteXCycle5(),
-                6 => AslAbsoluteXCycle6(),
-                7 => AslAbsoluteXCycle7(),
+               Timing.T2 => AslAbsoluteXCycle1(),
+               Timing.T3 =>AslAbsoluteXCycle2(),
+               Timing.T4 => AslAbsoluteXCycle3(),
+               Timing.T5 => AslAbsoluteXCycle4(),
+               Timing.T6 =>AslAbsoluteXCycle5(),
+               Timing.T0 => AslAbsoluteXCycle6(),
+               Timing.TPlus => AslAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0x1E)
             },       
             // 0x1F SLO abs, X (illegal)
-            0x1F => CurrentInstructionStep switch
+            0x1F => instructionTimer switch
             {
-                1 => SloAbsoluteXCycle1(),
-                2 => SloAbsoluteXCycle2(),
-                3 => SloAbsoluteXCycle3(),
-                4 => SloAbsoluteXCycle4(),
-                5 => SloAbsoluteXCycle5(),
-                6 => SloAbsoluteXCycle6(),
-                7 => SloAbsoluteXCycle7(),
+               Timing.T2 => SloAbsoluteXCycle1(),
+               Timing.T3 =>SloAbsoluteXCycle2(),
+               Timing.T4 => SloAbsoluteXCycle3(),
+               Timing.T5 => SloAbsoluteXCycle4(),
+               Timing.T6 =>SloAbsoluteXCycle5(),
+               Timing.T0 => SloAbsoluteXCycle6(),
+               Timing.TPlus => SloAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0x1F)
             },       
             // 0x20 JSR
-            0x20 => CurrentInstructionStep switch
+            0x20 => instructionTimer switch
             {
-                1 => JsrCycle1(),
-                2 => JsrCycle2(),
-                3 => JsrCycle3(),
-                4 => JsrCycle4(),
-                5 => JsrCycle5(),
-                6 => JsrCycle6(),
+               Timing.T2 => JsrCycle1(),
+               Timing.T3 =>JsrCycle2(),
+               Timing.T4 => JsrCycle3(),
+               Timing.T5 => JsrCycle4(),
+               Timing.T6 =>JsrCycle5(),
+               Timing.T0 => JsrCycle6(),
                 _ => throw new InvalidInstructionStepException(0x20)
             },       
             // 0x21 AND X, indirect
-            0x21 => CurrentInstructionStep switch
+            0x21 => instructionTimer switch
             {
-                1 => AndIndirectXCycle1(),
-                2 => AndIndirectXCycle2(),
-                3 => AndIndirectXCycle3(),
-                4 => AndIndirectXCycle4(),
-                5 => AndIndirectXCycle5(),
-                6 => AndIndirectXCycle6(),
+               Timing.T2 => AndIndirectXCycle1(),
+               Timing.T3 =>AndIndirectXCycle2(),
+               Timing.T4 => AndIndirectXCycle3(),
+               Timing.T5 => AndIndirectXCycle4(),
+               Timing.T6 =>AndIndirectXCycle5(),
+               Timing.T0 => AndIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x21)
             },       
             // 0x22 JAM (illegal)
             0x22 => Jam(),
             // 0x23 RLA X, indirect
-            0x23 => CurrentInstructionStep switch
+            0x23 => instructionTimer switch
             {
-                1 => RlaIndirectXCycle1(),
-                2 => RlaIndirectXCycle2(),
-                3 => RlaIndirectXCycle3(),
-                4 => RlaIndirectXCycle4(),
-                5 => RlaIndirectXCycle5(),
-                6 => RlaIndirectXCycle6(),
-                7 => RlaIndirectXCycle7(),
-                8 => RlaIndirectXCycle8(),
+               Timing.T2 => RlaIndirectXCycle1(),
+               Timing.T3 =>RlaIndirectXCycle2(),
+               Timing.T4 => RlaIndirectXCycle3(),
+               Timing.T5 => RlaIndirectXCycle4(),
+               Timing.T6 =>RlaIndirectXCycle5(),
+               Timing.T0 => RlaIndirectXCycle6(),
+               Timing.TPlus => RlaIndirectXCycle7(),
+               Timing.T8 => RlaIndirectXCycle8(),
                 _ => throw new InvalidInstructionStepException(0x23)
             },       
             // 0x24 BIT zeropage
-            0x24 => CurrentInstructionStep switch
+            0x24 => instructionTimer switch
             {
-                1 => BitZeropageCycle1(),
-                2 => BitZeropageCycle2(),
-                3 => BitZeropageCycle3(),
+               Timing.T2 => BitZeropageCycle1(),
+               Timing.T3 => BitZeropageCycle2(),
+               Timing.TPlus | Timing.T1 => BitLastCycle(),
                 _ => throw new InvalidInstructionStepException(0x24)
             },       
             // 0x25 AND zeropage
-            0x25 => CurrentInstructionStep switch
+            0x25 => instructionTimer switch
             {
-                1 => AndZeropageCycle1(), 
-                2 => AndZeropageCycle2(),
-                3 => AndZeropageCycle3(),
+               Timing.T2 => AndZeropageCycle1(), 
+               Timing.T3 =>AndZeropageCycle2(),
+               Timing.T4 => AndZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x25)
             },       
             // 0x26 ROL zeropage
-            0x26 => CurrentInstructionStep switch
+            0x26 => instructionTimer switch
             {
-                1 => RolZeropageCycle1(), 
-                2 => RolZeropageCycle2(),
-                3 => RolZeropageCycle3(),
-                4 => RolZeropageCycle4(),
-                5 => RolZeropageCycle5(),
-                _ => throw new InvalidInstructionStepException(0x26)
+               Timing.T2 => ZeropageCycle1(), 
+               Timing.T3 | Timing.SD1 => ZeropageCycle2(),
+               Timing.T4 | Timing.SD2 => RolCycle(),
+               Timing.T0 => RolZeropageCycle4(),
+               Timing.TPlus | Timing.T1 =>RolZeropageCycle5(),
+               _ => throw new InvalidInstructionStepException(0x26)
             },       
             // 0x27 RLA zeropage (illegal)
-            0x27 => CurrentInstructionStep switch
+            0x27 => instructionTimer switch
             {
-                1 => RlaZeropageCycle1(), 
-                2 => RlaZeropageCycle2(), 
-                3 => RlaZeropageCycle3(), 
-                4 => RlaZeropageCycle4(), 
-                5 => RlaZeropageCycle5(), 
+               Timing.T2 => RlaZeropageCycle1(), 
+               Timing.T3 =>RlaZeropageCycle2(), 
+               Timing.T4 => RlaZeropageCycle3(), 
+               Timing.T5 => RlaZeropageCycle4(), 
+               Timing.T6 =>RlaZeropageCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x27)
             },
             // 0x28 PHA
-            0x28 => CurrentInstructionStep switch
+            0x28 => instructionTimer switch
             {
-                1 => PlpCycle1(), 
-                2 => PlpCycle2(), 
-                3 => PlpCycle3(), 
-                4 => PlpCycle4(), 
+               Timing.T2 => PlpCycle1(), 
+               Timing.T3 =>PlpCycle2(), 
+               Timing.T4 => PlpCycle3(), 
+               Timing.T5 => PlpCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x28)
             },
             // 0x29 AND imd
-            0x29 => CurrentInstructionStep switch
+            0x29 => instructionTimer switch
             {
-                1 => AndImmCycle1(), 
-                2 => AndImmCycle2(), 
+               Timing.T2 | Timing.T0 => Timing.TPlus | Timing.T1, 
+               Timing.TPlus | Timing.T1 => LogicAnd(MemoryDataRegister), 
                 _ => throw new InvalidInstructionStepException(0x29)
             },
             // 0x2A ROL accum
-            0x2A => CurrentInstructionStep switch
+            0x2A => instructionTimer switch
             {
-                1 => RolAccumCycle1(), 
-                2 => RolAccumCycle2(), 
+               Timing.T2 => RolAccumCycle1(), 
+               Timing.T3 =>RolAccumCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x2A)
             },
             // 0x2B ANC (illegal)
-            0x2B => CurrentInstructionStep switch
+            0x2B => instructionTimer switch
             {
-                1 => AncCycle1(), 
-                2 => AncCycle2(), 
-                3 => AncCycle3(), 
+               Timing.T2 => AncCycle1(), 
+               Timing.T3 =>AncCycle2(), 
+               Timing.T4 => AncCycle3(), 
                 _ => throw new InvalidInstructionStepException(0x2B)
             },
             // 0x2C BIT abs
-            0x2C => CurrentInstructionStep switch
+            0x2C => instructionTimer switch
             {
-                1 => BitAbsoluteCycle1(), 
-                2 => BitAbsoluteCycle2(), 
-                3 => BitAbsoluteCycle3(), 
-                4 => BitAbsoluteCycle4(), 
+               Timing.T2 => AbsoluteCycle1(), 
+               Timing.T3 => AbsoluteCycle2(Timing.T0), 
+               Timing.T0 => AbsoluteCycle3(Timing.TPlus | Timing.T1), 
+               Timing.TPlus | Timing.T1 => BitLastCycle(), 
                 _ => throw new InvalidInstructionStepException(0x2C)
             },
             // 0x2D AND abs
-            0x2D => CurrentInstructionStep switch
+            0x2D => instructionTimer switch
             {
-                1 => AndAbsoluteCycle1(), 
-                2 => AndAbsoluteCycle2(), 
-                3 => AndAbsoluteCycle3(), 
-                4 => AndAbsoluteCycle4(), 
+               Timing.T2 => AbsoluteCycle1(), 
+               Timing.T3 => AbsoluteCycle2(Timing.T0), 
+               Timing.T0 => AbsoluteCycle3(Timing.TPlus | Timing.T1), 
+               Timing.TPlus | Timing.T1 => LogicAnd(MemoryDataRegister),
                 _ => throw new InvalidInstructionStepException(0x2D)
             },
             // 0x2E ROL abs
-            0x2E => CurrentInstructionStep switch
+            0x2E => instructionTimer switch
             {
-                1 => RolAbsoluteCycle1(), 
-                2 => RolAbsoluteCycle2(), 
-                3 => RolAbsoluteCycle3(), 
-                4 => RolAbsoluteCycle4(), 
-                5 => RolAbsoluteCycle5(), 
-                6 => RolAbsoluteCycle6(), 
+               Timing.T2 => AbsoluteCycle1(), 
+               Timing.T3 => AbsoluteCycle2(), 
+               Timing.T4 | Timing.SD1 => AbsoluteCycle3(), 
+               Timing.T5 | Timing.SD2 => RolCycle(), 
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister), 
+               Timing.TPlus | Timing.T1 => Timing.T2, 
                 _ => throw new InvalidInstructionStepException(0x2E)
             },
             // 0x2F RLA abs (illegal)
-            0x2F => CurrentInstructionStep switch
+            0x2F => instructionTimer switch
             {
-                1 => RlaAbsoluteCycle1(), 
-                2 => RlaAbsoluteCycle2(), 
-                3 => RlaAbsoluteCycle3(), 
-                4 => RlaAbsoluteCycle4(), 
-                5 => RlaAbsoluteCycle5(), 
-                6 => RlaAbsoluteCycle6(), 
+               Timing.T2 => RlaAbsoluteCycle1(), 
+               Timing.T3 =>RlaAbsoluteCycle2(), 
+               Timing.T4 => RlaAbsoluteCycle3(), 
+               Timing.T5 => RlaAbsoluteCycle4(), 
+               Timing.T6 =>RlaAbsoluteCycle5(), 
+               Timing.T0 => RlaAbsoluteCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x2F)
             },
             // 0x30 BMI
-            0x30 => CurrentInstructionStep switch
+            0x30 => instructionTimer switch
             {
-                1 => BmiCycle1(), 
-                2 => BmiCycle2(), 
-                3 => BmiCycle3(), 
-                4 => BmiCycle4(), 
+               Timing.T2 => BmiCycle1(), 
+               Timing.T3 =>BmiCycle2(), 
+               Timing.T4 => BmiCycle3(), 
+               Timing.T5 => BmiCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x30)
             },
             // 0x31 AND ind, Y
-            0x31 => CurrentInstructionStep switch
+            0x31 => instructionTimer switch
             {
-                1 => AndIndirectYCycle1(), 
-                2 => AndIndirectYCycle2(), 
-                3 => AndIndirectYCycle3(), 
-                4 => AndIndirectYCycle4(),  
-                5 => AndIndirectYCycle5(), 
-                6 => AndIndirectYCycle6(), 
+               Timing.T2 => AndIndirectYCycle1(), 
+               Timing.T3 =>AndIndirectYCycle2(), 
+               Timing.T4 => AndIndirectYCycle3(), 
+               Timing.T5 => AndIndirectYCycle4(),  
+               Timing.T6 =>AndIndirectYCycle5(), 
+               Timing.T0 => AndIndirectYCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x31)
             },
             // 0x32 JAM (illegal)
             0x32 => Jam(),
             // 0x33 RLA ind, Y (illegal)
-            0x33 => CurrentInstructionStep switch
+            0x33 => instructionTimer switch
             {
-                1 => RlaIndirectYCycle1(), 
-                2 => RlaIndirectYCycle2(), 
-                3 => RlaIndirectYCycle3(), 
-                4 => RlaIndirectYCycle4(),  
-                5 => RlaIndirectYCycle5(), 
-                6 => RlaIndirectYCycle6(), 
-                7 => RlaIndirectYCycle7(), 
-                8 => RlaIndirectYCycle8(), 
+               Timing.T2 => RlaIndirectYCycle1(), 
+               Timing.T3 =>RlaIndirectYCycle2(), 
+               Timing.T4 => RlaIndirectYCycle3(), 
+               Timing.T5 => RlaIndirectYCycle4(),  
+               Timing.T6 =>RlaIndirectYCycle5(), 
+               Timing.T0 => RlaIndirectYCycle6(), 
+               Timing.TPlus => RlaIndirectYCycle7(), 
+               Timing.T8 => RlaIndirectYCycle8(), 
                 _ => throw new InvalidInstructionStepException(0x33)
             },
             // 0x34 NOP zeropage, X
-            0x34 => CurrentInstructionStep switch
+            0x34 => instructionTimer switch
             {
-                1 => NopZeropageXCycle1(), 
-                2 => NopZeropageXCycle2(), 
-                3 => NopZeropageXCycle3(), 
-                4 => NopZeropageXCycle4(), 
+               Timing.T2 => NopZeropageXCycle1(), 
+               Timing.T3 =>NopZeropageXCycle2(), 
+               Timing.T4 => NopZeropageXCycle3(), 
+               Timing.T5 => NopZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x34)
             },
             // 0x35 AND zeropage, X
-            0x35 => CurrentInstructionStep switch
+            0x35 => instructionTimer switch
             {
-                1 => AndZeropageXCycle1(), 
-                2 => AndZeropageXCycle2(), 
-                3 => AndZeropageXCycle3(), 
-                4 => AndZeropageXCycle4(), 
+               Timing.T2 => AndZeropageXCycle1(), 
+               Timing.T3 =>AndZeropageXCycle2(), 
+               Timing.T4 => AndZeropageXCycle3(), 
+               Timing.T5 => AndZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x35)
             },
             // 0x36 ROL zeropage, X
-            0x36 => CurrentInstructionStep switch
+            0x36 => instructionTimer switch
             {
-                1 => RolZeropageXCycle1(), 
-                2 => RolZeropageXCycle2(), 
-                3 => RolZeropageXCycle3(), 
-                4 => RolZeropageXCycle4(), 
-                5 => RolZeropageXCycle5(), 
-                6 => RolZeropageXCycle6(), 
+               Timing.T2 => RolZeropageXCycle1(), 
+               Timing.T3 =>RolZeropageXCycle2(), 
+               Timing.T4 => RolZeropageXCycle3(), 
+               Timing.T5 => RolZeropageXCycle4(), 
+               Timing.T6 =>RolZeropageXCycle5(), 
+               Timing.T0 => RolZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x36)
             },
             // 0x37 RLA zeropage, X (illegal)
-            0x37 => CurrentInstructionStep switch
+            0x37 => instructionTimer switch
             {
-                1 => RlaZeropageXCycle1(), 
-                2 => RlaZeropageXCycle2(), 
-                3 => RlaZeropageXCycle3(), 
-                4 => RlaZeropageXCycle4(), 
-                5 => RlaZeropageXCycle5(), 
-                6 => RlaZeropageXCycle6(), 
+               Timing.T2 => RlaZeropageXCycle1(), 
+               Timing.T3 =>RlaZeropageXCycle2(), 
+               Timing.T4 => RlaZeropageXCycle3(), 
+               Timing.T5 => RlaZeropageXCycle4(), 
+               Timing.T6 =>RlaZeropageXCycle5(), 
+               Timing.T0 => RlaZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x37)
             },
             // 0x38 SEC implied
-            0x38 => CurrentInstructionStep switch
+            0x38 => instructionTimer switch
             {
-                1 => SecCycle1(), 
-                2 => SecCycle2(), 
+               Timing.T0 | Timing.T2 => SecCycle1(), 
+               Timing.TPlus =>SecCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x38)
             },
             // 0x39 And abs, Y
-            0x39 => CurrentInstructionStep switch
+            0x39 => instructionTimer switch
             {
-                1 => AndAbsoluteYCycle1(), 
-                2 => AndAbsoluteYCycle2(), 
-                3 => AndAbsoluteYCycle3(), 
-                4 => AndAbsoluteYCycle4(), 
-                5 => AndAbsoluteYCycle5(), 
+               Timing.T2 => AndAbsoluteYCycle1(), 
+               Timing.T3 =>AndAbsoluteYCycle2(), 
+               Timing.T4 => AndAbsoluteYCycle3(), 
+               Timing.T5 => AndAbsoluteYCycle4(), 
+               Timing.T6 =>AndAbsoluteYCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x39)
             },
             // 0x3A NOP implied (illegal)
-            0x3A => CurrentInstructionStep switch
+            0x3A => instructionTimer switch
             {
-                1 => NopImpliedCycle1(), 
-                2 => NopImpliedCycle2(), 
+               Timing.T2 => NopImpliedCycle1(), 
+               Timing.T3 =>NopImpliedCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x3A)
             },
             // 0x3B RLA abs, Y (illegal)
-            0x3B => CurrentInstructionStep switch
+            0x3B => instructionTimer switch
             {
-                1 => RlaAbsoluteYCycle1(), 
-                2 => RlaAbsoluteYCycle2(), 
-                3 => RlaAbsoluteYCycle3(), 
-                4 => RlaAbsoluteYCycle4(), 
-                5 => RlaAbsoluteYCycle5(),
-                6 => RlaAbsoluteYCycle6(),
-                7 => RlaAbsoluteYCycle7(),
+               Timing.T2 => RlaAbsoluteYCycle1(), 
+               Timing.T3 =>RlaAbsoluteYCycle2(), 
+               Timing.T4 => RlaAbsoluteYCycle3(), 
+               Timing.T5 => RlaAbsoluteYCycle4(), 
+               Timing.T6 =>RlaAbsoluteYCycle5(),
+               Timing.T0 => RlaAbsoluteYCycle6(),
+               Timing.TPlus => RlaAbsoluteYCycle7(),
                 _ => throw new InvalidInstructionStepException(0x3B)
             },
             // 0x3C NOP abs, X (illegal)
-            0x3C => CurrentInstructionStep switch
+            0x3C => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(), 
-                2 => NopAbsoluteXCycle2(), 
-                3 => NopAbsoluteXCycle3(), 
-                4 => NopAbsoluteXCycle4(), 
-                5 => NopAbsoluteXCycle5(),
+               Timing.T2 => NopAbsoluteXCycle1(), 
+               Timing.T3 =>NopAbsoluteXCycle2(), 
+               Timing.T4 => NopAbsoluteXCycle3(), 
+               Timing.T5 => NopAbsoluteXCycle4(), 
+               Timing.T6 =>NopAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x3C)
             },
             // 0x3D AND abs, X
-            0x3D => CurrentInstructionStep switch
+            0x3D => instructionTimer switch
             {
-                1 => AndAbsoluteXCycle1(), 
-                2 => AndAbsoluteXCycle2(), 
-                3 => AndAbsoluteXCycle3(), 
-                4 => AndAbsoluteXCycle4(), 
-                5 => AndAbsoluteXCycle5(), 
+               Timing.T2 => AndAbsoluteXCycle1(), 
+               Timing.T3 =>AndAbsoluteXCycle2(), 
+               Timing.T4 => AndAbsoluteXCycle3(), 
+               Timing.T5 => AndAbsoluteXCycle4(), 
+               Timing.T6 =>AndAbsoluteXCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x3D)
             },
             // 0x3E ROL abs, X
-            0x3E => CurrentInstructionStep switch
+            0x3E => instructionTimer switch
             {
-                1 => RolAbsoluteXCycle1(), 
-                2 => RolAbsoluteXCycle2(), 
-                3 => RolAbsoluteXCycle3(), 
-                4 => RolAbsoluteXCycle4(), 
-                5 => RolAbsoluteXCycle5(), 
-                6 => RolAbsoluteXCycle6(), 
-                7 => RolAbsoluteXCycle7(), 
+               Timing.T2 => RolAbsoluteXCycle1(), 
+               Timing.T3 =>RolAbsoluteXCycle2(), 
+               Timing.T4 => RolAbsoluteXCycle3(), 
+               Timing.T5 => RolAbsoluteXCycle4(), 
+               Timing.T6 =>RolAbsoluteXCycle5(), 
+               Timing.T0 => RolAbsoluteXCycle6(), 
+               Timing.TPlus => RolAbsoluteXCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x3E)
             },
             // 0x3F RLA abs, X (illegal)
-            0x3F => CurrentInstructionStep switch
+            0x3F => instructionTimer switch
             {
-                1 => RlaAbsoluteXCycle1(), 
-                2 => RlaAbsoluteXCycle2(), 
-                3 => RlaAbsoluteXCycle3(), 
-                4 => RlaAbsoluteXCycle4(), 
-                5 => RlaAbsoluteXCycle5(), 
-                6 => RlaAbsoluteXCycle6(), 
-                7 => RlaAbsoluteXCycle7(), 
+               Timing.T2 => RlaAbsoluteXCycle1(), 
+               Timing.T3 =>RlaAbsoluteXCycle2(), 
+               Timing.T4 => RlaAbsoluteXCycle3(), 
+               Timing.T5 => RlaAbsoluteXCycle4(), 
+               Timing.T6 =>RlaAbsoluteXCycle5(), 
+               Timing.T0 => RlaAbsoluteXCycle6(), 
+               Timing.TPlus => RlaAbsoluteXCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x3F)
             },
             // 0x40 RTI implied
-            0x40 => CurrentInstructionStep switch
+            0x40 => instructionTimer switch
             {
-                1 => RtiCycle1(), 
-                2 => RtiCycle2(), 
-                3 => RtiCycle3(), 
-                4 => RtiCycle4(), 
-                5 => RtiCycle5(), 
-                6 => RtiCycle6(), 
+               Timing.T2 => RtiCycle1(), 
+               Timing.T3 =>RtiCycle2(), 
+               Timing.T4 => RtiCycle3(), 
+               Timing.T5 => RtiCycle4(), 
+               Timing.T6 =>RtiCycle5(), 
+               Timing.T0 => RtiCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x40)
             },
             // 0x41 EOR indirect, X
-            0x41 => CurrentInstructionStep switch
+            0x41 => instructionTimer switch
             {
-                1 => EorIndirectXCycle1(), 
-                2 => EorIndirectXCycle2(), 
-                3 => EorIndirectXCycle3(), 
-                4 => EorIndirectXCycle4(), 
-                5 => EorIndirectXCycle5(), 
-                6 => EorIndirectXCycle6(), 
+               Timing.T2 => EorIndirectXCycle1(), 
+               Timing.T3 =>EorIndirectXCycle2(), 
+               Timing.T4 => EorIndirectXCycle3(), 
+               Timing.T5 => EorIndirectXCycle4(), 
+               Timing.T6 =>EorIndirectXCycle5(), 
+               Timing.T0 => EorIndirectXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x41)
             },
             // 0x42 JAM (illegal)
             0x42 => Jam(),
             // 0x43 Sre indirect, X
-            0x43 => CurrentInstructionStep switch
+            0x43 => instructionTimer switch
             {
-                1 => SreIndirectXCycle1(), 
-                2 => SreIndirectXCycle2(), 
-                3 => SreIndirectXCycle3(), 
-                4 => SreIndirectXCycle4(), 
-                5 => SreIndirectXCycle5(), 
-                6 => SreIndirectXCycle6(), 
-                7 => SreIndirectXCycle7(), 
-                8 => SreIndirectXCycle8(), 
+               Timing.T2 => SreIndirectXCycle1(), 
+               Timing.T3 =>SreIndirectXCycle2(), 
+               Timing.T4 => SreIndirectXCycle3(), 
+               Timing.T5 => SreIndirectXCycle4(), 
+               Timing.T6 =>SreIndirectXCycle5(), 
+               Timing.T0 => SreIndirectXCycle6(), 
+               Timing.TPlus => SreIndirectXCycle7(), 
+               Timing.T8 => SreIndirectXCycle8(), 
                 _ => throw new InvalidInstructionStepException(0x43)
             },
             // 0x44 NOP zeropage (illegal)
-            0x44 => CurrentInstructionStep switch
+            0x44 => instructionTimer switch
             {
-                1 => NopZeropageCycle1(), 
-                2 => NopZeropageCycle2(), 
-                3 => NopZeropageCycle3(), 
+               Timing.T2 => NopZeropageCycle1(), 
+               Timing.T3 =>NopZeropageCycle2(), 
+               Timing.T4 => NopZeropageCycle3(), 
                 _ => throw new InvalidInstructionStepException(0x44)
             },
             // 0x45 EOR zeropage
-            0x45 => CurrentInstructionStep switch
+            0x45 => instructionTimer switch
             {
-                1 => EorZeropageCycle1(), 
-                2 => EorZeropageCycle2(), 
-                3 => EorZeropageCycle3(), 
+               Timing.T2 => EorZeropageCycle1(), 
+               Timing.T3 =>EorZeropageCycle2(), 
+               Timing.T4 => EorZeropageCycle3(), 
                 _ => throw new InvalidInstructionStepException(0x45)
             },
             // 0x46 LSR zeropage
-            0x46 => CurrentInstructionStep switch
+            0x46 => instructionTimer switch
             {
-                1 => LsrZeropageCycle1(), 
-                2 => LsrZeropageCycle2(), 
-                3 => LsrZeropageCycle3(), 
-                4 => LsrZeropageCycle4(), 
-                5 => LsrZeropageCycle5(), 
+               Timing.T2 => LsrZeropageCycle1(), 
+               Timing.T3 =>LsrZeropageCycle2(), 
+               Timing.T4 => LsrZeropageCycle3(), 
+               Timing.T5 => LsrZeropageCycle4(), 
+               Timing.T6 =>LsrZeropageCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x46)
             },
             // 0x47 SRE zeropage (illegal)
-            0x47 => CurrentInstructionStep switch
+            0x47 => instructionTimer switch
             {
-                1 => SreZeropageCycle1(), 
-                2 => SreZeropageCycle2(), 
-                3 => SreZeropageCycle3(), 
-                4 => SreZeropageCycle4(), 
-                5 => SreZeropageCycle5(), 
+               Timing.T2 => SreZeropageCycle1(), 
+               Timing.T3 =>SreZeropageCycle2(), 
+               Timing.T4 => SreZeropageCycle3(), 
+               Timing.T5 => SreZeropageCycle4(), 
+               Timing.T6 =>SreZeropageCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x47)
             },
             // 0x48 PHA imp
-            0x48 => CurrentInstructionStep switch
+            0x48 => instructionTimer switch
             {
-                1 => PhaCycle1(), 
-                2 => PhaCycle2(), 
-                3 => PhaCycle3(), 
+               Timing.T2 => PhaCycle1(), 
+               Timing.T3 =>PhaCycle2(), 
+               Timing.T4 => PhaCycle3(), 
                 _ => throw new InvalidInstructionStepException(0x48)
             },
             // 0x49 EOR imm
-            0x49 => CurrentInstructionStep switch
+            0x49 => instructionTimer switch
             {
-                1 => EorImmCycle1(), 
-                2 => EorImmCycle2(), 
+               Timing.T2 => EorImmCycle1(), 
+               Timing.T3 =>EorImmCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x49)
             },
             // 0x4A LSR accum
-            0x4A => CurrentInstructionStep switch
+            0x4A => instructionTimer switch
             {
-                1 => LsrAccumCycle1(), 
-                2 => LsrAccumCycle2(), 
+               Timing.T2 => LsrAccumCycle1(), 
+               Timing.T3 =>LsrAccumCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x4A)
             },
             // 0x4B ALR (illegal)
-            0x4B => CurrentInstructionStep switch
+            0x4B => instructionTimer switch
             {
-                1 => AlrCycle1(), 
-                2 => AlrCycle2(), 
+               Timing.T2 | Timing.T0 => Timing.T3,
+               Timing.T3 => AlrCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x4B)
             },
             // 0x4C JMP abs
-            0x4C => CurrentInstructionStep switch
+            0x4C => instructionTimer switch
             {
-                1 => JmpAbsoluteCycle1(), 
-                2 => JmpAbsoluteCycle2(), 
-                3 => JmpAbsoluteCycle3(), 
-                4 => JmpAbsoluteCycle4(), 
+               Timing.T2 => JmpAbsoluteCycle1(), 
+               Timing.T3 =>JmpAbsoluteCycle2(), 
+               Timing.T4 => JmpAbsoluteCycle3(), 
+               Timing.T5 => JmpAbsoluteCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x4C)
             },
             // 0x4D EOR abs
-            0x4D => CurrentInstructionStep switch
+            0x4D => instructionTimer switch
             {
-                1 => EorAbsoluteCycle1(), 
-                2 => EorAbsoluteCycle2(), 
-                3 => EorAbsoluteCycle3(), 
-                4 => EorAbsoluteCycle4(), 
+               Timing.T2 => EorAbsoluteCycle1(), 
+               Timing.T3 =>EorAbsoluteCycle2(), 
+               Timing.T4 => EorAbsoluteCycle3(), 
+               Timing.T5 => EorAbsoluteCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x4D)
             },
             // 0x4E LSR abs
-            0x4E => CurrentInstructionStep switch
+            0x4E => instructionTimer switch
             {
-                1 => LsrAbsoluteCycle1(), 
-                2 => LsrAbsoluteCycle2(), 
-                3 => LsrAbsoluteCycle3(), 
-                4 => LsrAbsoluteCycle4(), 
-                5 => LsrAbsoluteCycle5(), 
-                6 => LsrAbsoluteCycle6(), 
+               Timing.T2 => LsrAbsoluteCycle1(), 
+               Timing.T3 =>LsrAbsoluteCycle2(), 
+               Timing.T4 => LsrAbsoluteCycle3(), 
+               Timing.T5 => LsrAbsoluteCycle4(), 
+               Timing.T6 =>LsrAbsoluteCycle5(), 
+               Timing.T0 => LsrAbsoluteCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x4E)
             },
             // 0x4F SRE abs (illegal)
-            0x4F => CurrentInstructionStep switch
+            0x4F => instructionTimer switch
             {
-                1 => SreAbsoluteCycle1(), 
-                2 => SreAbsoluteCycle2(), 
-                3 => SreAbsoluteCycle3(), 
-                4 => SreAbsoluteCycle4(), 
-                5 => SreAbsoluteCycle5(), 
-                6 => SreAbsoluteCycle6(), 
+               Timing.T2 => SreAbsoluteCycle1(), 
+               Timing.T3 =>SreAbsoluteCycle2(), 
+               Timing.T4 => SreAbsoluteCycle3(), 
+               Timing.T5 => SreAbsoluteCycle4(), 
+               Timing.T6 =>SreAbsoluteCycle5(), 
+               Timing.T0 => SreAbsoluteCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x4F)
             },
             // 0x50 BVC rel
-            0x50 => CurrentInstructionStep switch
+            0x50 => instructionTimer switch
             {
-                1 => BvcCycle1(), 
-                2 => BvcCycle2(), 
-                3 => BvcCycle3(), 
-                4 => BvcCycle4(), 
+               Timing.T2 => BvcCycle1(), 
+               Timing.T3 =>BvcCycle2(), 
+               Timing.T4 => BvcCycle3(), 
+               Timing.T5 => BvcCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x50)
             },
             // 0x51 BVC rel
-            0x51 => CurrentInstructionStep switch
+            0x51 => instructionTimer switch
             {
-                1 => EorIndirectYCycle1(), 
-                2 => EorIndirectYCycle2(), 
-                3 => EorIndirectYCycle3(), 
-                4 => EorIndirectYCycle4(), 
-                5 => EorIndirectYCycle5(), 
-                6 => EorIndirectYCycle6(), 
+               Timing.T2 => EorIndirectYCycle1(), 
+               Timing.T3 =>EorIndirectYCycle2(), 
+               Timing.T4 => EorIndirectYCycle3(), 
+               Timing.T5 => EorIndirectYCycle4(), 
+               Timing.T6 =>EorIndirectYCycle5(), 
+               Timing.T0 => EorIndirectYCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x51)
             },
             // 0x52 JAM
             0x52 => Jam(),
             // 0x53 SRE indirect, Y
-            0x53 => CurrentInstructionStep switch
+            0x53 => instructionTimer switch
             {
-                1 => SreIndirectYCycle1(), 
-                2 => SreIndirectYCycle2(), 
-                3 => SreIndirectYCycle3(), 
-                4 => SreIndirectYCycle4(), 
-                5 => SreIndirectYCycle5(), 
-                6 => SreIndirectYCycle6(), 
-                7 => SreIndirectYCycle7(), 
-                8 => SreIndirectYCycle8(), 
+               Timing.T2 => SreIndirectYCycle1(), 
+               Timing.T3 =>SreIndirectYCycle2(), 
+               Timing.T4 => SreIndirectYCycle3(), 
+               Timing.T5 => SreIndirectYCycle4(), 
+               Timing.T6 =>SreIndirectYCycle5(), 
+               Timing.T0 => SreIndirectYCycle6(), 
+               Timing.TPlus => SreIndirectYCycle7(), 
+               Timing.T8 => SreIndirectYCycle8(), 
                 _ => throw new InvalidInstructionStepException(0x53)
             },
             // 0x54 NOP zeropage, X
-            0x54 => CurrentInstructionStep switch
+            0x54 => instructionTimer switch
             {
-                1 => NopZeropageXCycle1(), 
-                2 => NopZeropageXCycle2(), 
-                3 => NopZeropageXCycle3(), 
-                4 => NopZeropageXCycle4(), 
+               Timing.T2 => NopZeropageXCycle1(), 
+               Timing.T3 =>NopZeropageXCycle2(), 
+               Timing.T4 => NopZeropageXCycle3(), 
+               Timing.T5 => NopZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x54)
             },
             // 0x55 EOR zeropage, X
-            0x55 => CurrentInstructionStep switch
+            0x55 => instructionTimer switch
             {
-                1 => EorZeropageXCycle1(), 
-                2 => EorZeropageXCycle2(), 
-                3 => EorZeropageXCycle3(), 
-                4 => EorZeropageXCycle4(), 
+               Timing.T2 => EorZeropageXCycle1(), 
+               Timing.T3 =>EorZeropageXCycle2(), 
+               Timing.T4 => EorZeropageXCycle3(), 
+               Timing.T5 => EorZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x55)
             },
             // 0x56 LSR zeropage, X
-            0x56 => CurrentInstructionStep switch
+            0x56 => instructionTimer switch
             {
-                1 => LsrZeropageXCycle1(), 
-                2 => LsrZeropageXCycle2(), 
-                3 => LsrZeropageXCycle3(), 
-                4 => LsrZeropageXCycle4(), 
-                5 => LsrZeropageXCycle5(), 
-                6 => LsrZeropageXCycle6(), 
+               Timing.T2 => LsrZeropageXCycle1(), 
+               Timing.T3 =>LsrZeropageXCycle2(), 
+               Timing.T4 => LsrZeropageXCycle3(), 
+               Timing.T5 => LsrZeropageXCycle4(), 
+               Timing.T6 =>LsrZeropageXCycle5(), 
+               Timing.T0 => LsrZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x56)
             },
             // 0x57 SRE zeropage, X
-            0x57 => CurrentInstructionStep switch
+            0x57 => instructionTimer switch
             {
-                1 => SreZeropageXCycle1(), 
-                2 => SreZeropageXCycle2(), 
-                3 => SreZeropageXCycle3(), 
-                4 => SreZeropageXCycle4(), 
-                5 => SreZeropageXCycle5(), 
-                6 => SreZeropageXCycle6(), 
+               Timing.T2 => SreZeropageXCycle1(), 
+               Timing.T3 =>SreZeropageXCycle2(), 
+               Timing.T4 => SreZeropageXCycle3(), 
+               Timing.T5 => SreZeropageXCycle4(), 
+               Timing.T6 =>SreZeropageXCycle5(), 
+               Timing.T0 => SreZeropageXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x57)
             },
             // 0x58 CLI impl
-            0x58 => CurrentInstructionStep switch
+            0x58 => instructionTimer switch
             {
-                1 => CliCycle1(), 
-                2 => CliCycle2(), 
+               Timing.T2 => CliCycle1(), 
+               Timing.T3 =>CliCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x58)
             },
             // 0x59 EOR abs, Y
-            0x59 => CurrentInstructionStep switch
+            0x59 => instructionTimer switch
             {
-                1 => EorAbsoluteYCycle1(), 
-                2 => EorAbsoluteYCycle2(), 
-                3 => EorAbsoluteYCycle3(), 
-                4 => EorAbsoluteYCycle4(), 
-                5 => EorAbsoluteYCycle5(), 
+               Timing.T2 => EorAbsoluteYCycle1(), 
+               Timing.T3 =>EorAbsoluteYCycle2(), 
+               Timing.T4 => EorAbsoluteYCycle3(), 
+               Timing.T5 => EorAbsoluteYCycle4(), 
+               Timing.T6 =>EorAbsoluteYCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x59)
             },
             // 0x5A NOP impl
-            0x5A => CurrentInstructionStep switch
+            0x5A => instructionTimer switch
             {
-                1 => NopImpliedCycle1(), 
-                2 => NopImpliedCycle2(), 
+               Timing.T2 => NopImpliedCycle1(), 
+               Timing.T3 =>NopImpliedCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x5A)
             },
             // 0x5B SRE abs, Y
-            0x5B => CurrentInstructionStep switch
+            0x5B => instructionTimer switch
             {
-                1 => SreAbsoluteYCycle1(), 
-                2 => SreAbsoluteYCycle2(), 
-                3 => SreAbsoluteYCycle3(), 
-                4 => SreAbsoluteYCycle4(), 
-                5 => SreAbsoluteYCycle5(), 
-                6 => SreAbsoluteYCycle6(), 
-                7 => SreAbsoluteYCycle7(), 
+               Timing.T2 => SreAbsoluteYCycle1(), 
+               Timing.T3 =>SreAbsoluteYCycle2(), 
+               Timing.T4 => SreAbsoluteYCycle3(), 
+               Timing.T5 => SreAbsoluteYCycle4(), 
+               Timing.T6 =>SreAbsoluteYCycle5(), 
+               Timing.T0 => SreAbsoluteYCycle6(), 
+               Timing.TPlus => SreAbsoluteYCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x5B)
             },
             // 0x5C NOP abs, X
-            0x5C => CurrentInstructionStep switch
+            0x5C => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(), 
-                2 => NopAbsoluteXCycle2(), 
-                3 => NopAbsoluteXCycle3(), 
-                4 => NopAbsoluteXCycle4(), 
-                5 => NopAbsoluteXCycle5(), 
+               Timing.T2 => NopAbsoluteXCycle1(), 
+               Timing.T3 =>NopAbsoluteXCycle2(), 
+               Timing.T4 => NopAbsoluteXCycle3(), 
+               Timing.T5 => NopAbsoluteXCycle4(), 
+               Timing.T6 =>NopAbsoluteXCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x5C)
             },
             // 0x5D EOR abs, X
-            0x5D => CurrentInstructionStep switch
+            0x5D => instructionTimer switch
             {
-                1 => EorAbsoluteXCycle1(), 
-                2 => EorAbsoluteXCycle2(), 
-                3 => EorAbsoluteXCycle3(), 
-                4 => EorAbsoluteXCycle4(), 
-                5 => EorAbsoluteXCycle5(), 
+               Timing.T2 => EorAbsoluteXCycle1(), 
+               Timing.T3 =>EorAbsoluteXCycle2(), 
+               Timing.T4 => EorAbsoluteXCycle3(), 
+               Timing.T5 => EorAbsoluteXCycle4(), 
+               Timing.T6 =>EorAbsoluteXCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x5D)
             },
             // 0x5E LSR abs, X
-            0x5E => CurrentInstructionStep switch
+            0x5E => instructionTimer switch
             {
-                1 => LsrAbsoluteXCycle1(), 
-                2 => LsrAbsoluteXCycle2(), 
-                3 => LsrAbsoluteXCycle3(), 
-                4 => LsrAbsoluteXCycle4(), 
-                5 => LsrAbsoluteXCycle5(), 
-                6 => LsrAbsoluteXCycle6(), 
-                7 => LsrAbsoluteXCycle7(), 
+               Timing.T2 => LsrAbsoluteXCycle1(), 
+               Timing.T3 =>LsrAbsoluteXCycle2(), 
+               Timing.T4 => LsrAbsoluteXCycle3(), 
+               Timing.T5 => LsrAbsoluteXCycle4(), 
+               Timing.T6 =>LsrAbsoluteXCycle5(), 
+               Timing.T0 => LsrAbsoluteXCycle6(), 
+               Timing.TPlus => LsrAbsoluteXCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x5E)
             },
             // 0x5F SRE abs, X
-            0x5F => CurrentInstructionStep switch
+            0x5F => instructionTimer switch
             {
-                1 => SreAbsoluteXCycle1(), 
-                2 => SreAbsoluteXCycle2(), 
-                3 => SreAbsoluteXCycle3(), 
-                4 => SreAbsoluteXCycle4(), 
-                5 => SreAbsoluteXCycle5(), 
-                6 => SreAbsoluteXCycle6(), 
-                7 => SreAbsoluteXCycle7(), 
+               Timing.T2 => SreAbsoluteXCycle1(), 
+               Timing.T3 =>SreAbsoluteXCycle2(), 
+               Timing.T4 => SreAbsoluteXCycle3(), 
+               Timing.T5 => SreAbsoluteXCycle4(), 
+               Timing.T6 =>SreAbsoluteXCycle5(), 
+               Timing.T0 => SreAbsoluteXCycle6(), 
+               Timing.TPlus => SreAbsoluteXCycle7(), 
                 _ => throw new InvalidInstructionStepException(0x5F)
             },
             // 0x60 RTS impl
-            0x60 => CurrentInstructionStep switch
+            0x60 => instructionTimer switch
             {
-                1 => RtsCycle1(), 
-                2 => RtsCycle2(), 
-                3 => RtsCycle3(), 
-                4 => RtsCycle4(), 
-                5 => RtsCycle5(), 
-                6 => RtsCycle6(), 
+               Timing.T2 => RtsCycle1(), 
+               Timing.T3 =>RtsCycle2(), 
+               Timing.T4 => RtsCycle3(), 
+               Timing.T5 => RtsCycle4(), 
+               Timing.T6 =>RtsCycle5(), 
+               Timing.T0 => RtsCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x60)
             },
             // 0x61 ADC indirect, X
-            0x61 => CurrentInstructionStep switch
+            0x61 => instructionTimer switch
             {
-                1 => AdcIndirectXCycle1(), 
-                2 => AdcIndirectXCycle2(), 
-                3 => AdcIndirectXCycle3(), 
-                4 => AdcIndirectXCycle4(), 
-                5 => AdcIndirectXCycle5(), 
-                6 => AdcIndirectXCycle6(), 
+               Timing.T2 => AdcIndirectXCycle1(), 
+               Timing.T3 =>AdcIndirectXCycle2(), 
+               Timing.T4 => AdcIndirectXCycle3(), 
+               Timing.T5 => AdcIndirectXCycle4(), 
+               Timing.T6 =>AdcIndirectXCycle5(), 
+               Timing.T0 => AdcIndirectXCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x61)
             },
             // 0x62 JAM
             0x62 => Jam(),
             // 0x63 RRA X, indirect
-            0x63 => CurrentInstructionStep switch
+            0x63 => instructionTimer switch
             {
-                1 => RraIndirectXCycle1(), 
-                2 => RraIndirectXCycle2(), 
-                3 => RraIndirectXCycle3(), 
-                4 => RraIndirectXCycle4(), 
-                5 => RraIndirectXCycle5(), 
-                6 => RraIndirectXCycle6(), 
-                7 => RraIndirectXCycle7(), 
-                8 => RraIndirectXCycle8(), 
+               Timing.T2 => RraIndirectXCycle1(), 
+               Timing.T3 =>RraIndirectXCycle2(), 
+               Timing.T4 => RraIndirectXCycle3(), 
+               Timing.T5 => RraIndirectXCycle4(), 
+               Timing.T6 =>RraIndirectXCycle5(), 
+               Timing.T0 => RraIndirectXCycle6(), 
+               Timing.TPlus => RraIndirectXCycle7(), 
+               Timing.T8 => RraIndirectXCycle8(), 
                 _ => throw new InvalidInstructionStepException(0x63)
             },
             // 0x64 NOP zeropage
-            0x64 => CurrentInstructionStep switch
+            0x64 => instructionTimer switch
             {
-                1 => NopZeropageXCycle1(), 
-                2 => NopZeropageXCycle2(), 
-                3 => NopZeropageXCycle3(), 
-                4 => NopZeropageXCycle4(), 
+               Timing.T2 => NopZeropageXCycle1(), 
+               Timing.T3 =>NopZeropageXCycle2(), 
+               Timing.T4 => NopZeropageXCycle3(), 
+               Timing.T5 => NopZeropageXCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x64)
             },
             // 0x65 ADC zeropage
-            0x65 => CurrentInstructionStep switch
+            0x65 => instructionTimer switch
             {
-                1 => AdcZeropageCycle1(), 
-                2 => AdcZeropageCycle2(), 
-                3 => AdcZeropageCycle3(), 
+               Timing.T2 => AdcZeropageCycle1(), 
+               Timing.T3 =>AdcZeropageCycle2(), 
+               Timing.T4 => AdcZeropageCycle3(), 
                 _ => throw new InvalidInstructionStepException(0x65)
             },
             // 0x66 ROR zeropage
-            0x66 => CurrentInstructionStep switch
+            0x66 => instructionTimer switch
             {
-                1 => RorZeropageCycle1(), 
-                2 => RorZeropageCycle2(), 
-                3 => RorZeropageCycle3(), 
-                4 => RorZeropageCycle4(), 
-                5 => RorZeropageCycle5(), 
+               Timing.T2 => RorZeropageCycle1(), 
+               Timing.T3 =>RorZeropageCycle2(), 
+               Timing.T4 => RorZeropageCycle3(), 
+               Timing.T5 => RorZeropageCycle4(), 
+               Timing.T6 =>RorZeropageCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x66)
             },
             // 0x67 RRA zeropage
-            0x67 => CurrentInstructionStep switch
+            0x67 => instructionTimer switch
             {
-                1 => RraZeropageCycle1(), 
-                2 => RraZeropageCycle2(), 
-                3 => RraZeropageCycle3(), 
-                4 => RraZeropageCycle4(), 
-                5 => RraZeropageCycle5(), 
+               Timing.T2 => RraZeropageCycle1(), 
+               Timing.T3 =>RraZeropageCycle2(), 
+               Timing.T4 => RraZeropageCycle3(), 
+               Timing.T5 => RraZeropageCycle4(), 
+               Timing.T6 =>RraZeropageCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x67)
             },
             // 0x68 PLA impl
-            0x68 => CurrentInstructionStep switch
+            0x68 => instructionTimer switch
             {
-                1 => PlaCycle1(), 
-                2 => PlaCycle2(), 
-                3 => PlaCycle3(), 
-                4 => PlaCycle4(), 
+               Timing.T2 => PlaCycle1(), 
+               Timing.T3 =>PlaCycle2(), 
+               Timing.T4 => PlaCycle3(), 
+               Timing.T5 => PlaCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x68)
             },
             // 0x69 ADC imm
-            0x69 => CurrentInstructionStep switch
+            0x69 => instructionTimer switch
             {
-                1 => AdcImmCycle1(), 
-                2 => AdcImmCycle2(), 
+               Timing.T2 | Timing.T0 => Timing.T3,
+               Timing.T3 => LogicAdd(MemoryDataRegister),
                 _ => throw new InvalidInstructionStepException(0x69)
             },
             // 0x6A ROR abs
-            0x6A => CurrentInstructionStep switch
+            0x6A => instructionTimer switch
             {
-                1 => RorAccumCycle1(), 
-                2 => RorAccumCycle2(), 
+               Timing.T2 => RorAccumCycle1(), 
+               Timing.T3 =>RorAccumCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x6A)
             },
             // 0x6B Arr imm
-            0x6B => CurrentInstructionStep switch
+            0x6B => instructionTimer switch
             {
-                1 => ArrCycle1(), 
-                2 => ArrCycle2(), 
+               Timing.T2 => ArrCycle1(), 
+               Timing.T3 =>ArrCycle2(), 
                 _ => throw new InvalidInstructionStepException(0x6B)
             },
             // 0x6C JMP indirect
-            0x6C => CurrentInstructionStep switch
+            0x6C => instructionTimer switch
             {
-                1 => JmpIndirectCycle1(), 
-                2 => JmpIndirectCycle2(), 
-                3 => JmpIndirectCycle3(), 
-                4 => JmpIndirectCycle4(), 
-                5 => JmpIndirectCycle5(), 
+               Timing.T2 => JmpIndirectCycle1(), 
+               Timing.T3 =>JmpIndirectCycle2(), 
+               Timing.T4 => JmpIndirectCycle3(), 
+               Timing.T5 => JmpIndirectCycle4(), 
+               Timing.T6 =>JmpIndirectCycle5(), 
                 _ => throw new InvalidInstructionStepException(0x6C)
             },
             // 0x6D ADC abs
-            0x6D => CurrentInstructionStep switch
+            0x6D => instructionTimer switch
             {
-                1 => AdcAbsoluteCycle1(), 
-                2 => AdcAbsoluteCycle2(), 
-                3 => AdcAbsoluteCycle3(), 
-                4 => AdcAbsoluteCycle4(), 
+               Timing.T2 => AbsoluteCycle1(), 
+               Timing.T3 => AbsoluteCycle2(Timing.T4), 
+               Timing.T4 => AbsoluteCycle3(Timing.T5), 
+               Timing.T5 => LogicAdd(MemoryDataRegister), 
                 _ => throw new InvalidInstructionStepException(0x6D)
             },
             // 0x6E ROR abs
-            0x6E => CurrentInstructionStep switch
+            0x6E => instructionTimer switch
             {
-                1 => RorAbsoluteCycle1(), 
-                2 => RorAbsoluteCycle2(), 
-                3 => RorAbsoluteCycle3(), 
-                4 => RorAbsoluteCycle4(), 
-                5 => RorAbsoluteCycle5(), 
-                6 => RorAbsoluteCycle6(), 
+               Timing.T2 => RorAbsoluteCycle1(), 
+               Timing.T3 =>RorAbsoluteCycle2(), 
+               Timing.T4 => RorAbsoluteCycle3(), 
+               Timing.T5 => RorAbsoluteCycle4(), 
+               Timing.T6 =>RorAbsoluteCycle5(), 
+               Timing.T0 => RorAbsoluteCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x6E)
             },
             // 0x6F RRA abs
-            0x6F => CurrentInstructionStep switch
+            0x6F => instructionTimer switch
             {
-                1 => RraAbsoluteCycle1(), 
-                2 => RraAbsoluteCycle2(), 
-                3 => RraAbsoluteCycle3(), 
-                4 => RraAbsoluteCycle4(), 
-                5 => RraAbsoluteCycle5(), 
-                6 => RraAbsoluteCycle6(), 
+               Timing.T2 => RraAbsoluteCycle1(), 
+               Timing.T3 =>RraAbsoluteCycle2(), 
+               Timing.T4 => RraAbsoluteCycle3(), 
+               Timing.T5 => RraAbsoluteCycle4(), 
+               Timing.T6 =>RraAbsoluteCycle5(), 
+               Timing.T0 => RraAbsoluteCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x6F)
             },
             // 0x70 BVS rel
-            0x70 => CurrentInstructionStep switch
+            0x70 => instructionTimer switch
             {
-                1 => BvsCycle1(), 
-                2 => BvsCycle2(), 
-                3 => BvsCycle3(), 
-                4 => BvsCycle4(), 
+               Timing.T2 => BvsCycle1(), 
+               Timing.T3 =>BvsCycle2(), 
+               Timing.T4 => BvsCycle3(), 
+               Timing.T5 => BvsCycle4(), 
                 _ => throw new InvalidInstructionStepException(0x70)
             },
             // 0x71 ADC ind, Y
-            0x71 => CurrentInstructionStep switch
+            0x71 => instructionTimer switch
             {
-                1 => AdcIndirectYCycle1(), 
-                2 => AdcIndirectYCycle2(), 
-                3 => AdcIndirectYCycle3(), 
-                4 => AdcIndirectYCycle4(), 
-                5 => AdcIndirectYCycle5(), 
-                6 => AdcIndirectYCycle6(), 
+               Timing.T2 => AdcIndirectYCycle1(), 
+               Timing.T3 =>AdcIndirectYCycle2(), 
+               Timing.T4 => AdcIndirectYCycle3(), 
+               Timing.T5 => AdcIndirectYCycle4(), 
+               Timing.T6 =>AdcIndirectYCycle5(), 
+               Timing.T0 => AdcIndirectYCycle6(), 
                 _ => throw new InvalidInstructionStepException(0x71)
             },
             // 0x72 JAM
             0x72 => Jam(),
             // 0x73 RRA ind, Y
-            0x73 => CurrentInstructionStep switch
+            0x73 => instructionTimer switch
             {
-                1 => RraIndirectYCycle1(), 
-                2 => RraIndirectYCycle2(), 
-                3 => RraIndirectYCycle3(), 
-                4 => RraIndirectYCycle4(), 
-                5 => RraIndirectYCycle5(), 
-                6 => RraIndirectYCycle6(), 
-                7 => RraIndirectYCycle7(), 
-                8 => RraIndirectYCycle8(), 
+               Timing.T2 => RraIndirectYCycle1(), 
+               Timing.T3 =>RraIndirectYCycle2(), 
+               Timing.T4 => RraIndirectYCycle3(), 
+               Timing.T5 => RraIndirectYCycle4(), 
+               Timing.T6 =>RraIndirectYCycle5(), 
+               Timing.T0 => RraIndirectYCycle6(), 
+               Timing.TPlus => RraIndirectYCycle7(), 
+               Timing.T8 => RraIndirectYCycle8(), 
                 _ => throw new InvalidInstructionStepException(0x73)
             },
             // 0x74 NOP zeropage, X
-            0x74 => CurrentInstructionStep switch
+            0x74 => instructionTimer switch
             {
-                1 => NopZeropageCycle1(),
-                2 => NopZeropageCycle2(),
-                3 => NopZeropageCycle3(),
+               Timing.T2 => NopZeropageCycle1(),
+               Timing.T3 =>NopZeropageCycle2(),
+               Timing.T4 => NopZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x74)
             },       
             // 0x75 ADC zeropage, X
-            0x75 => CurrentInstructionStep switch
+            0x75 => instructionTimer switch
             {
-                1 => AdcZeropageXCycle1(),
-                2 => AdcZeropageXCycle2(),
-                3 => AdcZeropageXCycle3(),
-                4 => AdcZeropageXCycle4(),
+               Timing.T2 => AdcZeropageXCycle1(),
+               Timing.T3 =>AdcZeropageXCycle2(),
+               Timing.T4 => AdcZeropageXCycle3(),
+               Timing.T5 => AdcZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0x75)
             },       
             // 0x76 ROR zeropage, X
-            0x76 => CurrentInstructionStep switch
+            0x76 => instructionTimer switch
             {
-                1 => RorZeropageXCycle1(),
-                2 => RorZeropageXCycle2(),
-                3 => RorZeropageXCycle3(),
-                4 => RorZeropageXCycle4(),
-                5 => RorZeropageXCycle5(),
-                6 => RorZeropageXCycle6(),
+               Timing.T2 => RorZeropageXCycle1(),
+               Timing.T3 =>RorZeropageXCycle2(),
+               Timing.T4 => RorZeropageXCycle3(),
+               Timing.T5 => RorZeropageXCycle4(),
+               Timing.T6 =>RorZeropageXCycle5(),
+               Timing.T0 => RorZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x76)
             },       
             // 0x77 RRA zeropage, X
-            0x77 => CurrentInstructionStep switch
+            0x77 => instructionTimer switch
             {
-                1 => RraZeropageXCycle1(),
-                2 => RraZeropageXCycle2(),
-                3 => RraZeropageXCycle3(),
-                4 => RraZeropageXCycle4(),
-                5 => RraZeropageXCycle5(),
-                6 => RraZeropageXCycle6(),
+               Timing.T2 => RraZeropageXCycle1(),
+               Timing.T3 =>RraZeropageXCycle2(),
+               Timing.T4 => RraZeropageXCycle3(),
+               Timing.T5 => RraZeropageXCycle4(),
+               Timing.T6 =>RraZeropageXCycle5(),
+               Timing.T0 => RraZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x77)
             },       
             // 0x78 SEI impl
-            0x78 => CurrentInstructionStep switch
+            0x78 => instructionTimer switch
             {
-                1 => SeiCycle1(),
-                2 => SeiCycle2(),
+               Timing.T2 => SeiCycle1(),
+               Timing.T3 =>SeiCycle2(),
                 _ => throw new InvalidInstructionStepException(0x78)
             },       
             // 0x79 ADC abs, Y
-            0x79 => CurrentInstructionStep switch
+            0x79 => instructionTimer switch
             {
-                1 => AdcAbsoluteYCycle1(),
-                2 => AdcAbsoluteYCycle2(),
-                3 => AdcAbsoluteYCycle3(),
-                4 => AdcAbsoluteYCycle4(),
-                5 => AdcAbsoluteYCycle5(),
+               Timing.T2 => AdcAbsoluteYCycle1(),
+               Timing.T3 =>AdcAbsoluteYCycle2(),
+               Timing.T4 => AdcAbsoluteYCycle3(),
+               Timing.T5 => AdcAbsoluteYCycle4(),
+               Timing.T6 =>AdcAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x79)
             },       
             // 0x7A NOP impl
-            0x7A => CurrentInstructionStep switch
+            0x7A => instructionTimer switch
             {
-                1 => NopImpliedCycle1(),
-                2 => NopImpliedCycle2(),
+               Timing.T2 => NopImpliedCycle1(),
+               Timing.T3 =>NopImpliedCycle2(),
                 _ => throw new InvalidInstructionStepException(0x7A)
             },       
             // 0x7B RRA abs, Y
-            0x7B => CurrentInstructionStep switch
+            0x7B => instructionTimer switch
             {
-                1 => RraAbsoluteYCycle1(),
-                2 => RraAbsoluteYCycle2(),
-                3 => RraAbsoluteYCycle3(),
-                4 => RraAbsoluteYCycle4(),
-                5 => RraAbsoluteYCycle5(),
-                6 => RraAbsoluteYCycle6(),
-                7 => RraAbsoluteYCycle7(),
+               Timing.T2 => RraAbsoluteYCycle1(),
+               Timing.T3 =>RraAbsoluteYCycle2(),
+               Timing.T4 => RraAbsoluteYCycle3(),
+               Timing.T5 => RraAbsoluteYCycle4(),
+               Timing.T6 =>RraAbsoluteYCycle5(),
+               Timing.T0 => RraAbsoluteYCycle6(),
+               Timing.TPlus => RraAbsoluteYCycle7(),
                 _ => throw new InvalidInstructionStepException(0x7B)
             },       
             // 0x7C NOP abs, X
-            0x7C => CurrentInstructionStep switch
+            0x7C => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(),
-                2 => NopAbsoluteXCycle2(),
-                3 => NopAbsoluteXCycle3(),
-                4 => NopAbsoluteXCycle4(),
-                5 => NopAbsoluteXCycle5(),
+               Timing.T2 => NopAbsoluteXCycle1(),
+               Timing.T3 =>NopAbsoluteXCycle2(),
+               Timing.T4 => NopAbsoluteXCycle3(),
+               Timing.T5 => NopAbsoluteXCycle4(),
+               Timing.T6 =>NopAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x7C)
             },       
             // 0x7D ADC abs, X
-            0x7D => CurrentInstructionStep switch
+            0x7D => instructionTimer switch
             {
-                1 => AdcAbsoluteXCycle1(),
-                2 => AdcAbsoluteXCycle2(),
-                3 => AdcAbsoluteXCycle3(),
-                4 => AdcAbsoluteXCycle4(),
-                5 => AdcAbsoluteXCycle5(),
+               Timing.T2 => AdcAbsoluteXCycle1(),
+               Timing.T3 =>AdcAbsoluteXCycle2(),
+               Timing.T4 => AdcAbsoluteXCycle3(),
+               Timing.T5 => AdcAbsoluteXCycle4(),
+               Timing.T6 =>AdcAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x7D)
             },       
             // 0x7E ROR abs, X
-            0x7E => CurrentInstructionStep switch
+            0x7E => instructionTimer switch
             {
-                1 => RorAbsoluteXCycle1(),
-                2 => RorAbsoluteXCycle2(),
-                3 => RorAbsoluteXCycle3(),
-                4 => RorAbsoluteXCycle4(),
-                5 => RorAbsoluteXCycle5(),
-                6 => RorAbsoluteXCycle6(),
-                7 => RorAbsoluteXCycle7(),
+               Timing.T2 => RorAbsoluteXCycle1(),
+               Timing.T3 =>RorAbsoluteXCycle2(),
+               Timing.T4 => RorAbsoluteXCycle3(),
+               Timing.T5 => RorAbsoluteXCycle4(),
+               Timing.T6 =>RorAbsoluteXCycle5(),
+               Timing.T0 => RorAbsoluteXCycle6(),
+               Timing.TPlus => RorAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0x7E)
             },       
             // 0x7F RRA abs, X
-            0x7F => CurrentInstructionStep switch
+            0x7F => instructionTimer switch
             {
-                1 => RraAbsoluteXCycle1(),
-                2 => RraAbsoluteXCycle2(),
-                3 => RraAbsoluteXCycle3(),
-                4 => RraAbsoluteXCycle4(),
-                5 => RraAbsoluteXCycle5(),
-                6 => RraAbsoluteXCycle6(),
-                7 => RraAbsoluteXCycle7(),
+               Timing.T2 => RraAbsoluteXCycle1(),
+               Timing.T3 =>RraAbsoluteXCycle2(),
+               Timing.T4 => RraAbsoluteXCycle3(),
+               Timing.T5 => RraAbsoluteXCycle4(),
+               Timing.T6 =>RraAbsoluteXCycle5(),
+               Timing.T0 => RraAbsoluteXCycle6(),
+               Timing.TPlus => RraAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0x7F)
             },       
             // 0x80 NOP imm
-            0x80 => CurrentInstructionStep switch
+            0x80 => instructionTimer switch
             {
-                1 => NopImmCycle1(),
-                2 => NopImmCycle2(),
+               Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x80)
             },       
             // 0x81 STA X, ind
-            0x81 => CurrentInstructionStep switch
+            0x81 => instructionTimer switch
             {
-                1 => StaIndirectXCycle1(),
-                2 => StaIndirectXCycle2(),
-                3 => StaIndirectXCycle3(),
-                4 => StaIndirectXCycle4(),
-                5 => StaIndirectXCycle5(),
-                6 => StaIndirectXCycle6(),
+               Timing.T2 => StaIndirectXCycle1(),
+               Timing.T3 =>StaIndirectXCycle2(),
+               Timing.T4 => StaIndirectXCycle3(),
+               Timing.T5 => StaIndirectXCycle4(),
+               Timing.T6 =>StaIndirectXCycle5(),
+               Timing.T0 => StaIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x81)
             },       
             // 0x82 NOP imm
-            0x82 => CurrentInstructionStep switch
+            0x82 => instructionTimer switch
             {
-                1 => NopImmCycle1(),
-                2 => NopImmCycle2(),
+               Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x82)
             },       
             // 0x83 SAX x, ind
-            0x83 => CurrentInstructionStep switch
+            0x83 => instructionTimer switch
             {
-                1 => SaxIndirectXCycle1(),
-                2 => SaxIndirectXCycle2(),
-                3 => SaxIndirectXCycle3(),
-                4 => SaxIndirectXCycle4(),
-                5 => SaxIndirectXCycle5(),
-                6 => SaxIndirectXCycle6(),
+               Timing.T2 => SaxIndirectXCycle1(),
+               Timing.T3 =>SaxIndirectXCycle2(),
+               Timing.T4 => SaxIndirectXCycle3(),
+               Timing.T5 => SaxIndirectXCycle4(),
+               Timing.T6 =>SaxIndirectXCycle5(),
+               Timing.T0 => SaxIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0x83)
             },       
             // 0x84 STY zpg
-            0x84 => CurrentInstructionStep switch
+            0x84 => instructionTimer switch
             {
-                1 => StyZeropageCycle1(),
-                2 => StyZeropageCycle2(),
-                3 => StyZeropageCycle3(),
+               Timing.T2 => StyZeropageCycle1(),
+               Timing.T3 =>StyZeropageCycle2(),
+               Timing.T4 => StyZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x84)
             },       
             // 0x85 STA zpg
-            0x85 => CurrentInstructionStep switch
+            0x85 => instructionTimer switch
             {
-                1 => StaZeropageCycle1(),
-                2 => StaZeropageCycle2(),
-                3 => StaZeropageCycle3(),
+               Timing.T2 => StaZeropageCycle1(),
+               Timing.T3 =>StaZeropageCycle2(),
+               Timing.T4 => StaZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x85)
             },       
             // 0x86 STX zpg
-            0x86 => CurrentInstructionStep switch
+            0x86 => instructionTimer switch
             {
-                1 => StxZeropageCycle1(),
-                2 => StxZeropageCycle2(),
-                3 => StxZeropageCycle3(),
+               Timing.T2 => StxZeropageCycle1(),
+               Timing.T3 =>StxZeropageCycle2(),
+               Timing.T4 => StxZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x86)
             },       
             // 0x87 SAX zpg
-            0x87 => CurrentInstructionStep switch
+            0x87 => instructionTimer switch
             {
-                1 => SaxZeropageCycle1(),
-                2 => SaxZeropageCycle2(),
-                3 => SaxZeropageCycle3(),
+               Timing.T2 => SaxZeropageCycle1(),
+               Timing.T3 =>SaxZeropageCycle2(),
+               Timing.T4 => SaxZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0x87)
             },       
             // 0x88 DEY impl
-            0x88 => CurrentInstructionStep switch
+            0x88 => instructionTimer switch
             {
-                1 => DeyCycle1(),
-                2 => DeyCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => DeyCycle2(),
                 _ => throw new InvalidInstructionStepException(0x88)
             },       
-            // 0x89 DEY impl
-            0x89 => CurrentInstructionStep switch
+            // 0x89 NOP impl
+            0x89 => instructionTimer switch
             {
-                1 => NopImmCycle1(),
-                2 => NopImmCycle2(),
+               Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x89)
             },       
             // 0x8A TXA impl
-            0x8A => CurrentInstructionStep switch
+            0x8A => instructionTimer switch
             {
-                1 => TxaCycle1(),
-                2 => TxaCycle2(),
+               Timing.T2 | Timing.T0 => Timing.TPlus | Timing.T0,
+               Timing.TPlus | Timing.T1 => TransferLastCycle(X, DestinationRegister.Accumulator),
                 _ => throw new InvalidInstructionStepException(0x8A)
             },       
             // 0x8B ANE impl
-            0x8B => CurrentInstructionStep switch
+            0x8B => instructionTimer switch
             {
-                1 => AneCycle1(),
-                2 => AneCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => AneCycle2(),
                 _ => throw new InvalidInstructionStepException(0x8B)
             },       
             // 0x8C STY abs
-            0x8C => CurrentInstructionStep switch
+            0x8C => instructionTimer switch
             {
-                1 => StyAbsoluteCycle1(),
-                2 => StyAbsoluteCycle2(),
-                3 => StyAbsoluteCycle3(),
-                4 => StyAbsoluteCycle4(),
+               Timing.T2 => StyAbsoluteCycle1(),
+               Timing.T3 =>StyAbsoluteCycle2(),
+               Timing.T4 => StyAbsoluteCycle3(),
+               Timing.T5 => StyAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0x8C)
             },       
             // 0x8D STA abs
-            0x8D => CurrentInstructionStep switch
+            0x8D => instructionTimer switch
             {
-                1 => StaAbsoluteCycle1(),
-                2 => StaAbsoluteCycle2(),
-                3 => StaAbsoluteCycle3(),
-                4 => StaAbsoluteCycle4(),
+               Timing.T2 => StaAbsoluteCycle1(),
+               Timing.T3 =>StaAbsoluteCycle2(),
+               Timing.T4 => StaAbsoluteCycle3(),
+               Timing.T5 => StaAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0x8D)
             },       
             // 0x8E STX abs
-            0x8E => CurrentInstructionStep switch
+            0x8E => instructionTimer switch
             {
-                1 => StxAbsoluteCycle1(),
-                2 => StxAbsoluteCycle2(),
-                3 => StxAbsoluteCycle3(),
-                4 => StxAbsoluteCycle4(),
+               Timing.T2 => StxAbsoluteCycle1(),
+               Timing.T3 =>StxAbsoluteCycle2(),
+               Timing.T4 => StxAbsoluteCycle3(),
+               Timing.T5 => StxAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0x8E)
             },       
             // 0x8F STA abs
-            0x8F => CurrentInstructionStep switch
+            0x8F => instructionTimer switch
             {
-                1 => SaxAbsoluteCycle1(),
-                2 => SaxAbsoluteCycle2(),
-                3 => SaxAbsoluteCycle3(),
-                4 => SaxAbsoluteCycle4(),
+               Timing.T2 => SaxAbsoluteCycle1(),
+               Timing.T3 =>SaxAbsoluteCycle2(),
+               Timing.T4 => SaxAbsoluteCycle3(),
+               Timing.T5 => SaxAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0x8F)
             },       
             // 0x90 BCC rel
-            0x90 => CurrentInstructionStep switch
+            0x90 => instructionTimer switch
             {
-                1 => BccCycle1(),
-                2 => BccCycle2(),
-                3 => BccCycle3(),
-                4 => BccCycle4(),
+               Timing.T2 => BccCycle1(),
+               Timing.T3 =>BccCycle2(),
+               Timing.T4 => BccCycle3(),
+               Timing.T5 => BccCycle4(),
                 _ => throw new InvalidInstructionStepException(0x90)
             },       
             // 0x91 STA ind, Y
-            0x91 => CurrentInstructionStep switch
+            0x91 => instructionTimer switch
             {
-                1 => StaIndirectYCycle1(),
-                2 => StaIndirectYCycle2(),
-                3 => StaIndirectYCycle3(),
-                4 => StaIndirectYCycle4(),
-                5 => StaIndirectYCycle5(),
-                6 => StaIndirectYCycle6(),
+               Timing.T2 => StaIndirectYCycle1(),
+               Timing.T3 =>StaIndirectYCycle2(),
+               Timing.T4 => StaIndirectYCycle3(),
+               Timing.T5 => StaIndirectYCycle4(),
+               Timing.T6 =>StaIndirectYCycle5(),
+               Timing.T0 => StaIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0x91)
             },       
             // 0x92 Sta ind, Y
             0x92 => Jam(),
             // 0x93 SHA ind, Y
-            0x93 => CurrentInstructionStep switch
+            0x93 => instructionTimer switch
             {
-                1 => ShaIndirectYCycle1(),
-                2 => ShaIndirectYCycle2(),
-                3 => ShaIndirectYCycle3(),
-                4 => ShaIndirectYCycle4(),
-                5 => ShaIndirectYCycle5(),
+               Timing.T2 => ShaIndirectYCycle1(),
+               Timing.T3 =>ShaIndirectYCycle2(),
+               Timing.T4 => ShaIndirectYCycle3(),
+               Timing.T5 => ShaIndirectYCycle4(),
+               Timing.T6 =>ShaIndirectYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x93)
             },       
             // 0x94 STY zpg, X
-            0x94 => CurrentInstructionStep switch
+            0x94 => instructionTimer switch
             {
-                1 => StyZeropageXCycle1(),
-                2 => StyZeropageXCycle2(),
-                3 => StyZeropageXCycle3(),
-                4 => StyZeropageXCycle4(),
+               Timing.T2 => StyZeropageXCycle1(),
+               Timing.T3 =>StyZeropageXCycle2(),
+               Timing.T4 => StyZeropageXCycle3(),
+               Timing.T5 => StyZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0x94)
             },       
             // 0x95 STA zpg, X
-            0x95 => CurrentInstructionStep switch
+            0x95 => instructionTimer switch
             {
-                1 => StaZeropageXCycle1(),
-                2 => StaZeropageXCycle2(),
-                3 => StaZeropageXCycle3(),
-                4 => StaZeropageXCycle4(),
+               Timing.T2 => StaZeropageXCycle1(),
+               Timing.T3 =>StaZeropageXCycle2(),
+               Timing.T4 => StaZeropageXCycle3(),
+               Timing.T5 => StaZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0x95)
             },       
             // 0x96 STX zpg, X
-            0x96 => CurrentInstructionStep switch
+            0x96 => instructionTimer switch
             {
-                1 => StxZeropageYCycle1(),
-                2 => StxZeropageYCycle2(),
-                3 => StxZeropageYCycle3(), 
-                4 => StxZeropageYCycle4(),
+               Timing.T2 => StxZeropageYCycle1(),
+               Timing.T3 =>StxZeropageYCycle2(),
+               Timing.T4 => StxZeropageYCycle3(), 
+               Timing.T5 => StxZeropageYCycle4(),
                 _ => throw new InvalidInstructionStepException(0x96)
             },       
             // 0x97 SAX zpg, Y
-            0x97 => CurrentInstructionStep switch
+            0x97 => instructionTimer switch
             {
-                1 => SaxZeropageYCycle1(),
-                2 => SaxZeropageYCycle2(),
-                3 => SaxZeropageYCycle3(),
-                4 => SaxZeropageYCycle4(),
-                5 => SaxZeropageYCycle5(),
-                6 => SaxZeropageYCycle6(),
+               Timing.T2 => SaxZeropageYCycle1(),
+               Timing.T3 =>SaxZeropageYCycle2(),
+               Timing.T4 => SaxZeropageYCycle3(),
+               Timing.T5 => SaxZeropageYCycle4(),
+               Timing.T6 =>SaxZeropageYCycle5(),
+               Timing.T0 => SaxZeropageYCycle6(),
                 _ => throw new InvalidInstructionStepException(0x97)
             },       
             // 0x98 TYA impl
-            0x98 => CurrentInstructionStep switch
+            0x98 => instructionTimer switch
             {
-                1 => TyaCycle1(),
-                2 => TyaCycle2(),
+               Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => TransferLastCycle(Y, DestinationRegister.Accumulator),
                 _ => throw new InvalidInstructionStepException(0x98)
             },       
             // 0x99 STA abs, Y
-            0x99 => CurrentInstructionStep switch
+            0x99 => instructionTimer switch
             {
-                1 => StaAbsoluteYCycle1(),
-                2 => StaAbsoluteYCycle2(),
-                3 => StaAbsoluteYCycle3(),
-                4 => StaAbsoluteYCycle4(),
-                5 => StaAbsoluteYCycle5(),
+               Timing.T2 => StaAbsoluteYCycle1(),
+               Timing.T3 =>StaAbsoluteYCycle2(),
+               Timing.T4 => StaAbsoluteYCycle3(),
+               Timing.T5 => StaAbsoluteYCycle4(),
+               Timing.T6 =>StaAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x99)
             },       
             // 0x9A TXS impl
-            0x9A => CurrentInstructionStep switch
+            0x9A => instructionTimer switch
             {
-                1 => TxsCycle1(),
-                2 => TxsCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => TransferLastCycle(X, DestinationRegister.StackPointer),
                 _ => throw new InvalidInstructionStepException(0x9A)
             },       
             // 0x9B TAS abs, Y
-            0x9B => CurrentInstructionStep switch
+            0x9B => instructionTimer switch
             {
-                1 => TasCycle1(),
-                2 => TasCycle2(),
-                3 => TasCycle3(),
-                4 => TasCycle4(),
-                5 => TasCycle5(),
+               Timing.T2 => TasCycle1(),
+               Timing.T3 =>TasCycle2(),
+               Timing.T4 => TasCycle3(),
+               Timing.T5 => TasCycle4(),
+               Timing.T6 =>TasCycle5(),
                 _ => throw new InvalidInstructionStepException(0x9B)
             },       
             // 0x9C SHY abs, X
-            0x9C => CurrentInstructionStep switch
+            0x9C => instructionTimer switch
             {
-                1 => ShyCycle1(),
-                2 => ShyCycle2(),
-                3 => ShyCycle3(),
-                4 => ShyCycle4(),
-                5 => ShyCycle5(),
+               Timing.T2 => ShyCycle1(),
+               Timing.T3 =>ShyCycle2(),
+               Timing.T4 => ShyCycle3(),
+               Timing.T5 => ShyCycle4(),
+               Timing.T6 =>ShyCycle5(),
                 _ => throw new InvalidInstructionStepException(0x9C)
             },       
             // 0x9D STA abs, X
-            0x9D => CurrentInstructionStep switch
+            0x9D => instructionTimer switch
             {
-                1 => StaAbsoluteXCycle1(),
-                2 => StaAbsoluteXCycle2(),
-                3 => StaAbsoluteXCycle3(),
-                4 => StaAbsoluteXCycle4(),
-                5 => StaAbsoluteXCycle5(),
+               Timing.T2 => StaAbsoluteXCycle1(),
+               Timing.T3 =>StaAbsoluteXCycle2(),
+               Timing.T4 => StaAbsoluteXCycle3(),
+               Timing.T5 => StaAbsoluteXCycle4(),
+               Timing.T6 =>StaAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0x9D)
             },       
             // 0x9E SHX abs, Y
-            0x9E => CurrentInstructionStep switch
+            0x9E => instructionTimer switch
             {
-                1 => ShxCycle1(),
-                2 => ShxCycle2(),
-                3 => ShxCycle3(),
-                4 => ShxCycle4(),
-                5 => ShxCycle5(),
+               Timing.T2 => ShxCycle1(),
+               Timing.T3 =>ShxCycle2(),
+               Timing.T4 => ShxCycle3(),
+               Timing.T5 => ShxCycle4(),
+               Timing.T6 =>ShxCycle5(),
                 _ => throw new InvalidInstructionStepException(0x9E)
             },       
             // 0x9F SHX abs, Y
-            0x9F => CurrentInstructionStep switch
+            0x9F => instructionTimer switch
             {
-                1 => ShaAbsoluteYCycle1(),
-                2 => ShaAbsoluteYCycle2(),
-                3 => ShaAbsoluteYCycle3(),
-                4 => ShaAbsoluteYCycle4(),
-                5 => ShaAbsoluteYCycle5(),
+               Timing.T2 => ShaAbsoluteYCycle1(),
+               Timing.T3 =>ShaAbsoluteYCycle2(),
+               Timing.T4 => ShaAbsoluteYCycle3(),
+               Timing.T5 => ShaAbsoluteYCycle4(),
+               Timing.T6 =>ShaAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0x9F)
             },       
             // 0xA0 LDY imm
-            0xA0 => CurrentInstructionStep switch
+            0xA0 => instructionTimer switch
             {
-                1 => LdyImmCycle1(),
-                2 => LdyImmCycle2(),
+               Timing.T2 => LdyImmCycle1(),
+               Timing.T3 =>LdyImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xA0)
             },       
             // 0xA1 LDA X, ind
-            0xA1 => CurrentInstructionStep switch
+            0xA1 => instructionTimer switch
             {
-                1 => LdaIndirectXCycle1(),
-                2 => LdaIndirectXCycle2(),
-                3 => LdaIndirectXCycle3(),
-                4 => LdaIndirectXCycle4(),
-                5 => LdaIndirectXCycle5(),
-                6 => LdaIndirectXCycle6(),
+               Timing.T2 => LdaIndirectXCycle1(),
+               Timing.T3 =>LdaIndirectXCycle2(),
+               Timing.T4 => LdaIndirectXCycle3(),
+               Timing.T5 => LdaIndirectXCycle4(),
+               Timing.T6 =>LdaIndirectXCycle5(),
+               Timing.T0 => LdaIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xA1)
             },       
             // 0xA2 LDX imm
-            0xA2 => CurrentInstructionStep switch
+            0xA2 => instructionTimer switch
             {
-                1 => LdxImmCycle1(),
-                2 => LdxImmCycle2(),
+               Timing.T2 => LdxImmCycle1(),
+               Timing.T3 =>LdxImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xA2)
             },       
             // 0xA3 LAX X, ind
-            0xA3 => CurrentInstructionStep switch
+            0xA3 => instructionTimer switch
             {
-                1 => LaxIndirectXCycle1(),
-                2 => LaxIndirectXCycle2(),
-                3 => LaxIndirectXCycle3(),
-                4 => LaxIndirectXCycle4(),
-                5 => LaxIndirectXCycle5(),
-                6 => LaxIndirectXCycle6(),
+               Timing.T2 => LaxIndirectXCycle1(),
+               Timing.T3 =>LaxIndirectXCycle2(),
+               Timing.T4 => LaxIndirectXCycle3(),
+               Timing.T5 => LaxIndirectXCycle4(),
+               Timing.T6 =>LaxIndirectXCycle5(),
+               Timing.T0 => LaxIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xA3)
             },       
             // 0xA4 LDY zpg
-            0xA4 => CurrentInstructionStep switch
+            0xA4 => instructionTimer switch
             {
-                1 => LdyZeropageCycle1(),
-                2 => LdyZeropageCycle2(),
-                3 => LdyZeropageCycle3(),
+               Timing.T2 => LdyZeropageCycle1(),
+               Timing.T3 =>LdyZeropageCycle2(),
+               Timing.T4 => LdyZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xA4)
             },       
             // 0xA5 LDA zpg
-            0xA5 => CurrentInstructionStep switch
+            0xA5 => instructionTimer switch
             {
-                1 => LdaZeropageCycle1(),
-                2 => LdaZeropageCycle2(),
-                3 => LdaZeropageCycle3(),
+               Timing.T2 => LdaZeropageCycle1(),
+               Timing.T3 =>LdaZeropageCycle2(),
+               Timing.T4 => LdaZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xA5)
             },       
             // 0xA6 LDX zpg
-            0xA6 => CurrentInstructionStep switch
+            0xA6 => instructionTimer switch
             {
-                1 => LdxZeropageCycle1(),
-                2 => LdxZeropageCycle2(),
-                3 => LdxZeropageCycle3(),
+               Timing.T2 => LdxZeropageCycle1(),
+               Timing.T3 =>LdxZeropageCycle2(),
+               Timing.T4 => LdxZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xA6)
             },       
             // 0xA7 LAX zpg
-            0xA7 => CurrentInstructionStep switch
+            0xA7 => instructionTimer switch
             {
-                1 => LaxZeropageCycle1(),
-                2 => LaxZeropageCycle2(),
-                3 => LaxZeropageCycle3(),
+               Timing.T2 => LaxZeropageCycle1(),
+               Timing.T3 =>LaxZeropageCycle2(),
+               Timing.T4 => LaxZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xA7)
             },       
             // 0xA8 TAY impl
-            0xA8 => CurrentInstructionStep switch
+            0xA8 => instructionTimer switch
             {
-                1 => TayCycle1(),
-                2 => TayCycle2(),
+               TWO_CYCLE_FIRST_TIMING => LAST_CYCLE_TIMING,
+               LAST_CYCLE_TIMING => TransferLastCycle(Accumulator, DestinationRegister.IndexY),
                 _ => throw new InvalidInstructionStepException(0xA8)
             },       
             // 0xA9 LDA imm
-            0xA9 => CurrentInstructionStep switch
+            0xA9 => instructionTimer switch
             {
-                1 => LdaImmCycle1(),
-                2 => LdaImmCycle2(),
+               TWO_CYCLE_FIRST_TIMING => LAST_CYCLE_TIMING,
+               LAST_CYCLE_TIMING => LdaImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xA9)
             },       
             // 0xAA TAX impl
-            0xAA => CurrentInstructionStep switch
+            0xAA => instructionTimer switch
             {
-                1 => TaxCycle1(),
-                2 => TaxCycle2(),
+               TWO_CYCLE_FIRST_TIMING => LAST_CYCLE_TIMING,
+               LAST_CYCLE_TIMING => TransferLastCycle(Accumulator, DestinationRegister.IndexX),
                 _ => throw new InvalidInstructionStepException(0xAA)
             },       
             // 0xAB LXA imm
-            0xAB => CurrentInstructionStep switch
+            0xAB => instructionTimer switch
             {
-                1 => LxaCycle1(),
-                2 => LxaCycle2(),
+               Timing.T2 => LxaCycle1(),
+               Timing.T3 =>LxaCycle2(),
                 _ => throw new InvalidInstructionStepException(0xAB)
             },       
             // 0xAC LDY abs
-            0xAC => CurrentInstructionStep switch
+            0xAC => instructionTimer switch
             {
-                1 => LdyAbsoluteCycle1(),
-                2 => LdyAbsoluteCycle2(),
-                3 => LdyAbsoluteCycle3(),
-                4 => LdyAbsoluteCycle4(),
+               Timing.T2 => LdyAbsoluteCycle1(),
+               Timing.T3 =>LdyAbsoluteCycle2(),
+               Timing.T4 => LdyAbsoluteCycle3(),
+               Timing.T5 => LdyAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xAC)
             },       
             // 0xAD LDA abs
-            0xAD => CurrentInstructionStep switch
+            0xAD => instructionTimer switch
             {
-                1 => LdaAbsoluteCycle1(),
-                2 => LdaAbsoluteCycle2(),
-                3 => LdaAbsoluteCycle3(),
-                4 => LdaAbsoluteCycle4(),
+               Timing.T2 => LdaAbsoluteCycle1(),
+               Timing.T3 =>LdaAbsoluteCycle2(),
+               Timing.T4 => LdaAbsoluteCycle3(),
+               Timing.T5 => LdaAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xAD)
             },       
             // 0xAE LDX abs
-            0xAE => CurrentInstructionStep switch
+            0xAE => instructionTimer switch
             {
-                1 => LdxAbsoluteCycle1(),
-                2 => LdxAbsoluteCycle2(),
-                3 => LdxAbsoluteCycle3(),
-                4 => LdxAbsoluteCycle4(),
+               Timing.T2 => LdxAbsoluteCycle1(),
+               Timing.T3 =>LdxAbsoluteCycle2(),
+               Timing.T4 => LdxAbsoluteCycle3(),
+               Timing.T5 => LdxAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xAE)
             },       
             // 0xAF LAX abs
-            0xAF => CurrentInstructionStep switch
+            0xAF => instructionTimer switch
             {
-                1 => LaxAbsoluteCycle1(),
-                2 => LaxAbsoluteCycle2(),
-                3 => LaxAbsoluteCycle3(),
-                4 => LaxAbsoluteCycle4(),
+               Timing.T2 => LaxAbsoluteCycle1(),
+               Timing.T3 =>LaxAbsoluteCycle2(),
+               Timing.T4 => LaxAbsoluteCycle3(),
+               Timing.T5 => LaxAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xAF)
             },       
             // 0xB0 BCS rel
-            0xB0 => CurrentInstructionStep switch
+            0xB0 => instructionTimer switch
             {
-                1 => BcsCycle1(),
-                2 => BcsCycle2(),
-                3 => BcsCycle3(),
-                4 => BcsCycle4(),
+               Timing.T2 => BcsCycle1(),
+               Timing.T3 =>BcsCycle2(),
+               Timing.T4 => BcsCycle3(),
+               Timing.T5 => BcsCycle4(),
                 _ => throw new InvalidInstructionStepException(0xB0)
             },       
             // 0xB1 LDA ind, Y
-            0xB1 => CurrentInstructionStep switch
+            0xB1 => instructionTimer switch
             {
-                1 => LdaIndirectYCycle1(),
-                2 => LdaIndirectYCycle2(),
-                3 => LdaIndirectYCycle3(),
-                4 => LdaIndirectYCycle4(),
-                5 => LdaIndirectYCycle5(),
-                6 => LdaIndirectYCycle6(),
+               Timing.T2 => LdaIndirectYCycle1(),
+               Timing.T3 =>LdaIndirectYCycle2(),
+               Timing.T4 => LdaIndirectYCycle3(),
+               Timing.T5 => LdaIndirectYCycle4(),
+               Timing.T6 =>LdaIndirectYCycle5(),
+               Timing.T0 => LdaIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0xB1)
             },       
             // 0xB2 Jam
             0xB2 => Jam(),
             // 0xB3 LAX ind, Y
-            0xB3 => CurrentInstructionStep switch
+            0xB3 => instructionTimer switch
             {
-                1 => LaxIndirectYCycle1(),
-                2 => LaxIndirectYCycle2(),
-                3 => LaxIndirectYCycle3(),
-                4 => LaxIndirectYCycle4(),
-                5 => LaxIndirectYCycle5(),
-                6 => LaxIndirectYCycle6(),
+               Timing.T2 => LaxIndirectYCycle1(),
+               Timing.T3 =>LaxIndirectYCycle2(),
+               Timing.T4 => LaxIndirectYCycle3(),
+               Timing.T5 => LaxIndirectYCycle4(),
+               Timing.T6 =>LaxIndirectYCycle5(),
+               Timing.T0 => LaxIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0xB3)
             },       
             // 0xB4 LDY zpg, X
-            0xB4 => CurrentInstructionStep switch
+            0xB4 => instructionTimer switch
             {
-                1 => LdyZeropageXCycle1(),
-                2 => LdyZeropageXCycle2(),
-                3 => LdyZeropageXCycle3(),
-                4 => LdyZeropageXCycle4(),
+               Timing.T2 => LdyZeropageXCycle1(),
+               Timing.T3 =>LdyZeropageXCycle2(),
+               Timing.T4 => LdyZeropageXCycle3(),
+               Timing.T5 => LdyZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xB4)
             },       
             // 0xB5 LDA zpg, X
-            0xB5 => CurrentInstructionStep switch
+            0xB5 => instructionTimer switch
             {
-                1 => LdaZeropageXCycle1(),
-                2 => LdaZeropageXCycle2(),
-                3 => LdaZeropageXCycle3(),
-                4 => LdaZeropageXCycle4(),
+               Timing.T2 => LdaZeropageXCycle1(),
+               Timing.T3 =>LdaZeropageXCycle2(),
+               Timing.T4 => LdaZeropageXCycle3(),
+               Timing.T5 => LdaZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xB5)
             },       
             // 0xB6 LDX zpg, Y
-            0xB6 => CurrentInstructionStep switch
+            0xB6 => instructionTimer switch
             {
-                1 => LdxZeropageYCycle1(),
-                2 => LdxZeropageYCycle2(),
-                3 => LdxZeropageYCycle3(),
-                4 => LdxZeropageYCycle4(),
+               Timing.T2 => LdxZeropageYCycle1(),
+               Timing.T3 =>LdxZeropageYCycle2(),
+               Timing.T4 => LdxZeropageYCycle3(),
+               Timing.T5 => LdxZeropageYCycle4(),
                 _ => throw new InvalidInstructionStepException(0xB6)
             },       
             // 0xB7 LAX zpg, X
-            0xB7 => CurrentInstructionStep switch
+            0xB7 => instructionTimer switch
             {
-                1 => LaxZeropageYCycle1(),
-                2 => LaxZeropageYCycle2(),
-                3 => LaxZeropageYCycle3(),
-                4 => LaxZeropageYCycle4(),
+               Timing.T2 => LaxZeropageYCycle1(),
+               Timing.T3 =>LaxZeropageYCycle2(),
+               Timing.T4 => LaxZeropageYCycle3(),
+               Timing.T5 => LaxZeropageYCycle4(),
                 _ => throw new InvalidInstructionStepException(0xB7)
             },       
             // 0xB8 CLV impl
-            0xB8 => CurrentInstructionStep switch
+            0xB8 => instructionTimer switch
             {
-                1 => ClvCycle1(),
-                2 => ClvCycle2(),
+               Timing.T2 => ClvCycle1(),
+               Timing.T3 =>ClvCycle2(),
                 _ => throw new InvalidInstructionStepException(0xB8)
             },       
             // 0xB9 LDA abs, Y
-            0xB9 => CurrentInstructionStep switch
+            0xB9 => instructionTimer switch
             {
-                1 => LdaAbsoluteYCycle1(),
-                2 => LdaAbsoluteYCycle2(),
-                3 => LdaAbsoluteYCycle3(),
-                4 => LdaAbsoluteYCycle4(),
-                5 => LdaAbsoluteYCycle5(),
+               Timing.T2 => LdaAbsoluteYCycle1(),
+               Timing.T3 =>LdaAbsoluteYCycle2(),
+               Timing.T4 => LdaAbsoluteYCycle3(),
+               Timing.T5 => LdaAbsoluteYCycle4(),
+               Timing.T6 =>LdaAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0xB9)
             },       
             // 0xBA TSX impl
-            0xBA => CurrentInstructionStep switch
+            0xBA => instructionTimer switch
             {
-                1 => TsxCycle1(),
-                2 => TsxCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => TransferLastCycle(StackPointer, DestinationRegister.IndexX),
                 _ => throw new InvalidInstructionStepException(0xBA)
             },       
             // 0xBB LAS abs, Y
-            0xBB => CurrentInstructionStep switch
+            0xBB => instructionTimer switch
             {
-                1 => LasCycle1(),
-                2 => LasCycle2(),
-                3 => LasCycle3(),
-                4 => LasCycle4(),
+               Timing.T2 => LasCycle1(),
+               Timing.T3 =>LasCycle2(),
+               Timing.T4 => LasCycle3(),
+               Timing.T5 => LasCycle4(),
                 _ => throw new InvalidInstructionStepException(0xBB)
             },       
             // 0xBC LDY abs, X
-            0xBC => CurrentInstructionStep switch
+            0xBC => instructionTimer switch
             {
-                1 => LdyAbsoluteXCycle1(),
-                2 => LdyAbsoluteXCycle2(),
-                3 => LdyAbsoluteXCycle3(),
-                4 => LdyAbsoluteXCycle4(),
-                5 => LdyAbsoluteXCycle5(),
+               Timing.T2 => LdyAbsoluteXCycle1(),
+               Timing.T3 =>LdyAbsoluteXCycle2(),
+               Timing.T4 => LdyAbsoluteXCycle3(),
+               Timing.T5 => LdyAbsoluteXCycle4(),
+               Timing.T6 =>LdyAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xBC)
             },       
             // 0xBD LDA abs, X
-            0xBD => CurrentInstructionStep switch
+            0xBD => instructionTimer switch
             {
-                1 => LdaAbsoluteXCycle1(),
-                2 => LdaAbsoluteXCycle2(),
-                3 => LdaAbsoluteXCycle3(),
-                4 => LdaAbsoluteXCycle4(),
-                5 => LdaAbsoluteXCycle5(),
+               Timing.T2 => LdaAbsoluteXCycle1(),
+               Timing.T3 =>LdaAbsoluteXCycle2(),
+               Timing.T4 => LdaAbsoluteXCycle3(),
+               Timing.T5 => LdaAbsoluteXCycle4(),
+               Timing.T6 =>LdaAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xBD)
             },       
             // 0xBE LDX abs, Y
-            0xBE => CurrentInstructionStep switch
+            0xBE => instructionTimer switch
             {
-                1 => LdxAbsoluteYCycle1(),
-                2 => LdxAbsoluteYCycle2(),
-                3 => LdxAbsoluteYCycle3(),
-                4 => LdxAbsoluteYCycle4(),
-                5 => LdxAbsoluteYCycle5(),
+               Timing.T2 => LdxAbsoluteYCycle1(),
+               Timing.T3 =>LdxAbsoluteYCycle2(),
+               Timing.T4 => LdxAbsoluteYCycle3(),
+               Timing.T5 => LdxAbsoluteYCycle4(),
+               Timing.T6 =>LdxAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0xBE)
             },       
             // 0xBF LAX abs, Y
-            0xBF => CurrentInstructionStep switch
+            0xBF => instructionTimer switch
             {
-                1 => LaxAbsoluteYCycle1(),
-                2 => LaxAbsoluteYCycle2(),
-                3 => LaxAbsoluteYCycle3(),
-                4 => LaxAbsoluteYCycle4(),
-                5 => LaxAbsoluteYCycle5(),
+               Timing.T2 => LaxAbsoluteYCycle1(),
+               Timing.T3 =>LaxAbsoluteYCycle2(),
+               Timing.T4 => LaxAbsoluteYCycle3(),
+               Timing.T5 => LaxAbsoluteYCycle4(),
+               Timing.T6 =>LaxAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0xBF)
             },       
             // 0xC0 CPY imm
-            0xC0 => CurrentInstructionStep switch
+            0xC0 => instructionTimer switch
             {
-                1 => CpyImmCycle1(),
-                2 => CpyImmCycle2(),
+               Timing.T2 => CpyImmCycle1(),
+               Timing.T3 =>CpyImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xC0)
             },       
             // 0xC1 CMP X, ind
-            0xC1 => CurrentInstructionStep switch
+            0xC1 => instructionTimer switch
             {
-                1 => CmpIndirectXCycle1(),
-                2 => CmpIndirectXCycle2(),
-                3 => CmpIndirectXCycle3(),
-                4 => CmpIndirectXCycle4(),
-                5 => CmpIndirectXCycle5(),
-                6 => CmpIndirectXCycle6(),
+               Timing.T2 => CmpIndirectXCycle1(),
+               Timing.T3 =>CmpIndirectXCycle2(),
+               Timing.T4 => CmpIndirectXCycle3(),
+               Timing.T5 => CmpIndirectXCycle4(),
+               Timing.T6 =>CmpIndirectXCycle5(),
+               Timing.T0 => CmpIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xC1)
             },       
             // 0xC2 NOP
             0xC2 => Jam(),
             // 0xC3 DCP X, ind
-            0xC3 => CurrentInstructionStep switch
+            0xC3 => instructionTimer switch
             {
-                1 => DcpIndirectXCycle1(),
-                2 => DcpIndirectXCycle2(),
-                3 => DcpIndirectXCycle3(),
-                4 => DcpIndirectXCycle4(),
-                5 => DcpIndirectXCycle5(),
-                6 => DcpIndirectXCycle6(),
-                7 => DcpIndirectXCycle7(),
-                8 => DcpIndirectXCycle8(),
+               Timing.T2 => DcpIndirectXCycle1(),
+               Timing.T3 =>DcpIndirectXCycle2(),
+               Timing.T4 => DcpIndirectXCycle3(),
+               Timing.T5 => DcpIndirectXCycle4(),
+               Timing.T6 =>DcpIndirectXCycle5(),
+               Timing.T0 => DcpIndirectXCycle6(),
+               Timing.TPlus => DcpIndirectXCycle7(),
+               Timing.T8 => DcpIndirectXCycle8(),
                 _ => throw new InvalidInstructionStepException(0xC3)
             },       
             // 0xC4 CPY zpg
-            0xC4 => CurrentInstructionStep switch
+            0xC4 => instructionTimer switch
             {
-                1 => CpyZeropageCycle1(),
-                2 => CpyZeropageCycle2(),
-                3 => CpyZeropageCycle3(),
+               Timing.T2 => CpyZeropageCycle1(),
+               Timing.T3 =>CpyZeropageCycle2(),
+               Timing.T4 => CpyZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xC4)
             },       
             // 0xC5 CMP zpg
-            0xC5 => CurrentInstructionStep switch
+            0xC5 => instructionTimer switch
             {
-                1 => CmpZeropageCycle1(),
-                2 => CmpZeropageCycle2(),
-                3 => CmpZeropageCycle3(),
+               Timing.T2 => CmpZeropageCycle1(),
+               Timing.T3 =>CmpZeropageCycle2(),
+               Timing.T4 => CmpZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xC5)
             },       
             // 0xC6 DEC zpg
-            0xC6 => CurrentInstructionStep switch
+            0xC6 => instructionTimer switch
             {
-                1 => DecZeropageCycle1(),
-                2 => DecZeropageCycle2(),
-                3 => DecZeropageCycle3(),
-                4 => DecZeropageCycle4(),
-                5 => DecZeropageCycle5(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 | Timing.SD1 => ZeropageCycle2(),
+               Timing.T4 | Timing.SD2 => DecZeropageCycle3(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xC6)
             },       
             // 0xC7 DCP zpg
-            0xC7 => CurrentInstructionStep switch
+            0xC7 => instructionTimer switch
             {
-                1 => DcpZeropageCycle1(),
-                2 => DcpZeropageCycle2(),
-                3 => DcpZeropageCycle3(),
-                4 => DcpZeropageCycle4(),
-                5 => DcpZeropageCycle5(),
+               Timing.T2 => DcpZeropageCycle1(),
+               Timing.T3 =>DcpZeropageCycle2(),
+               Timing.T4 => DcpZeropageCycle3(),
+               Timing.T5 => DcpZeropageCycle4(),
+               Timing.T6 =>DcpZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0xC7)
             },       
             // 0xC8 INY impl
-            0xC8 => CurrentInstructionStep switch
+            0xC8 => instructionTimer switch
             {
-                1 => InyCycle1(),
-                2 => InyCycle2(),
+               Timing.T2 => InyCycle1(),
+               Timing.T3 =>InyCycle2(),
                 _ => throw new InvalidInstructionStepException(0xC8)
             },       
             // 0xC9 CMP imm
-            0xC9 => CurrentInstructionStep switch
+            0xC9 => instructionTimer switch
             {
-                1 => CmpImmCycle1(),
-                2 => CmpImmCycle2(),
+               Timing.T2 => CmpImmCycle1(),
+               Timing.T3 =>CmpImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xC9)
             },       
             // 0xCA DEX impl
-            0xCA => CurrentInstructionStep switch
+            0xCA => instructionTimer switch
             {
-                1 => DexCycle1(),
-                2 => DexCycle2(),
+               Timing.T2 => DexCycle1(),
+               Timing.T3 =>DexCycle2(),
                 _ => throw new InvalidInstructionStepException(0xCA)
             },       
             // 0xCB SBX imm
-            0xCB => CurrentInstructionStep switch
+            0xCB => instructionTimer switch
             {
-                1 => SbxCycle1(),
-                2 => SbxCycle2(),
+               Timing.T2 => SbxCycle1(),
+               Timing.T3 =>SbxCycle2(),
                 _ => throw new InvalidInstructionStepException(0xCB)
             },       
             // 0xCC CPY abs
-            0xCC => CurrentInstructionStep switch
+            0xCC => instructionTimer switch
             {
-                1 => CpyAbsoluteCycle1(),
-                2 => CpyAbsoluteCycle2(),
-                3 => CpyAbsoluteCycle3(),
-                4 => CpyAbsoluteCycle4(),
+               Timing.T2 => CpyAbsoluteCycle1(),
+               Timing.T3 =>CpyAbsoluteCycle2(),
+               Timing.T4 => CpyAbsoluteCycle3(),
+               Timing.T5 => CpyAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xCC)
             },       
             // 0xCD CMP abs
-            0xCD => CurrentInstructionStep switch
+            0xCD => instructionTimer switch
             {
-                1 => CmpAbsoluteCycle1(),
-                2 => CmpAbsoluteCycle2(),
-                3 => CmpAbsoluteCycle3(),
-                4 => CmpAbsoluteCycle4(),
+               Timing.T2 => CmpAbsoluteCycle1(),
+               Timing.T3 =>CmpAbsoluteCycle2(),
+               Timing.T4 => CmpAbsoluteCycle3(),
+               Timing.T5 => CmpAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xCD)
             },       
             // 0xCE DEC abs
-            0xCE => CurrentInstructionStep switch
+            0xCE => instructionTimer switch
             {
-                1 => DecAbsoluteCycle1(),
-                2 => DecAbsoluteCycle2(),
-                3 => DecAbsoluteCycle3(),
-                4 => DecAbsoluteCycle4(),
-                5 => DecAbsoluteCycle5(),
-                6 => DecAbsoluteCycle6(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 | Timing.SD1 => AbsoluteCycle3(),
+               Timing.T5 | Timing.SD2 => DecAbsoluteCycle4(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xCE)
             },       
             // 0xCF DCP abs
-            0xCF => CurrentInstructionStep switch
+            0xCF => instructionTimer switch
             {
-                1 => DcpAbsoluteCycle1(),
-                2 => DcpAbsoluteCycle2(),
-                3 => DcpAbsoluteCycle3(),
-                4 => DcpAbsoluteCycle4(),
-                5 => DcpAbsoluteCycle5(),
-                6 => DcpAbsoluteCycle6(),
+               Timing.T2 => DcpAbsoluteCycle1(),
+               Timing.T3 =>DcpAbsoluteCycle2(),
+               Timing.T4 => DcpAbsoluteCycle3(),
+               Timing.T5 => DcpAbsoluteCycle4(),
+               Timing.T6 =>DcpAbsoluteCycle5(),
+               Timing.T0 => DcpAbsoluteCycle6(),
                 _ => throw new InvalidInstructionStepException(0xCF)
             },       
             // 0xD0 BNE rel
-            0xD0 => CurrentInstructionStep switch
+            0xD0 => instructionTimer switch
             {
-                1 => BneCycle1(),
-                2 => BneCycle2(),
-                3 => BneCycle3(),
-                4 => BneCycle4(),
+               Timing.T2 => BneCycle1(),
+               Timing.T3 =>BneCycle2(),
+               Timing.T4 => BneCycle3(),
+               Timing.T5 => BneCycle4(),
                 _ => throw new InvalidInstructionStepException(0xD0)
             },       
             // 0xD1 CMP ind, Y
-            0xD1 => CurrentInstructionStep switch
+            0xD1 => instructionTimer switch
             {
-                1 => CmpIndirectYCycle1(),
-                2 => CmpIndirectYCycle2(),
-                3 => CmpIndirectYCycle3(),
-                4 => CmpIndirectYCycle4(),
-                5 => CmpIndirectYCycle5(),
-                6 => CmpIndirectYCycle6(),
+               Timing.T2 => CmpIndirectYCycle1(),
+               Timing.T3 =>CmpIndirectYCycle2(),
+               Timing.T4 => CmpIndirectYCycle3(),
+               Timing.T5 => CmpIndirectYCycle4(),
+               Timing.T6 =>CmpIndirectYCycle5(),
+               Timing.T0 => CmpIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0xD1)
             },       
             // 0xD2 Jam
             0xD2 => Jam(),
             // 0xD3 DCP ind, Y
-            0xD3 => CurrentInstructionStep switch
+            0xD3 => instructionTimer switch
             {
-                1 => DcpIndirectYCycle1(),
-                2 => DcpIndirectYCycle2(),
-                3 => DcpIndirectYCycle3(),
-                4 => DcpIndirectYCycle4(),
-                5 => DcpIndirectYCycle5(),
-                6 => DcpIndirectYCycle6(),
-                7 => DcpIndirectYCycle7(),
-                8 => DcpIndirectYCycle8(),
+               Timing.T2 => DcpIndirectYCycle1(),
+               Timing.T3 =>DcpIndirectYCycle2(),
+               Timing.T4 => DcpIndirectYCycle3(),
+               Timing.T5 => DcpIndirectYCycle4(),
+               Timing.T6 =>DcpIndirectYCycle5(),
+               Timing.T0 => DcpIndirectYCycle6(),
+               Timing.TPlus => DcpIndirectYCycle7(),
+               Timing.T8 => DcpIndirectYCycle8(),
                 _ => throw new InvalidInstructionStepException(0xD3)
             },       
             // 0xD4 NOP zpg, X
-            0xD4 => CurrentInstructionStep switch
+            0xD4 => instructionTimer switch
             {
-                1 => NopZeropageXCycle1(),
-                2 => NopZeropageXCycle2(),
-                3 => NopZeropageXCycle3(),
-                4 => NopZeropageXCycle4(),
+               Timing.T2 => NopZeropageXCycle1(),
+               Timing.T3 =>NopZeropageXCycle2(),
+               Timing.T4 => NopZeropageXCycle3(),
+               Timing.T5 => NopZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xD4)
             },       
             // 0xD5 CMP zpg, X
-            0xD5 => CurrentInstructionStep switch
+            0xD5 => instructionTimer switch
             {
-                1 => CmpZeropageXCycle1(),
-                2 => CmpZeropageXCycle2(),
-                3 => CmpZeropageXCycle3(),
-                4 => CmpZeropageXCycle4(),
+               Timing.T2 => CmpZeropageXCycle1(),
+               Timing.T3 =>CmpZeropageXCycle2(),
+               Timing.T4 => CmpZeropageXCycle3(),
+               Timing.T5 => CmpZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xD5)
             },       
             // 0xD6 DEC zpg, X
-            0xD6 => CurrentInstructionStep switch
+            0xD6 => instructionTimer switch
             {
-                1 => DecZeropageXCycle1(),
-                2 => DecZeropageXCycle2(),
-                3 => DecZeropageXCycle3(),
-                4 => DecZeropageXCycle4(),
-                5 => DecZeropageXCycle5(),
-                6 => DecZeropageXCycle6(),
+               Timing.T2 => DecZeropageXCycle1(),
+               Timing.T3 =>DecZeropageXCycle2(),
+               Timing.T4 => DecZeropageXCycle3(),
+               Timing.T5 => DecZeropageXCycle4(),
+               Timing.T6 =>DecZeropageXCycle5(),
+               Timing.T0 => DecZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xD6)
             },       
             // 0xD7 DCP zpg, X
-            0xD7 => CurrentInstructionStep switch
+            0xD7 => instructionTimer switch
             {
-                1 => DcpZeropageXCycle1(),
-                2 => DcpZeropageXCycle2(),
-                3 => DcpZeropageXCycle3(),
-                4 => DcpZeropageXCycle4(),
-                5 => DcpZeropageXCycle5(),
-                6 => DcpZeropageXCycle6(),
+               Timing.T2 => DcpZeropageXCycle1(),
+               Timing.T3 =>DcpZeropageXCycle2(),
+               Timing.T4 => DcpZeropageXCycle3(),
+               Timing.T5 => DcpZeropageXCycle4(),
+               Timing.T6 =>DcpZeropageXCycle5(),
+               Timing.T0 => DcpZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xD7)
             },       
             // 0xD8 CLD impl
-            0xD8 => CurrentInstructionStep switch
+            0xD8 => instructionTimer switch
             {
-                1 => CldCycle1(),
-                2 => CldCycle2(),
+               Timing.T2 => CldCycle1(),
+               Timing.T3 =>CldCycle2(),
                 _ => throw new InvalidInstructionStepException(0xD8)
             },       
             // 0xD9 CMP abs, Y
-            0xD9 => CurrentInstructionStep switch
+            0xD9 => instructionTimer switch
             {
-                1 => CmpAbsoluteYCycle1(),
-                2 => CmpAbsoluteYCycle2(),
-                3 => CmpAbsoluteYCycle3(),
-                4 => CmpAbsoluteYCycle4(),
-                5 => CmpAbsoluteYCycle5(),
+               Timing.T2 => CmpAbsoluteYCycle1(),
+               Timing.T3 =>CmpAbsoluteYCycle2(),
+               Timing.T4 => CmpAbsoluteYCycle3(),
+               Timing.T5 => CmpAbsoluteYCycle4(),
+               Timing.T6 =>CmpAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0xD9)
             },       
             // 0xDA NOP impl
-            0xDA => CurrentInstructionStep switch
+            0xDA => instructionTimer switch
             {
-                1 => NopImpliedCycle1(),
-                2 => NopImpliedCycle2(),
+               Timing.T2 => NopImpliedCycle1(),
+               Timing.T3 =>NopImpliedCycle2(),
                 _ => throw new InvalidInstructionStepException(0xDA)
             },       
             // 0xDB DCP abs, Y
-            0xDB => CurrentInstructionStep switch
+            0xDB => instructionTimer switch
             {
-                1 => DcpAbsoluteYCycle1(),
-                2 => DcpAbsoluteYCycle2(),
-                3 => DcpAbsoluteYCycle3(),
-                4 => DcpAbsoluteYCycle4(),
-                5 => DcpAbsoluteYCycle5(),
-                6 => DcpAbsoluteYCycle6(),
-                7 => DcpAbsoluteYCycle7(),
+               Timing.T2 => DcpAbsoluteYCycle1(),
+               Timing.T3 =>DcpAbsoluteYCycle2(),
+               Timing.T4 => DcpAbsoluteYCycle3(),
+               Timing.T5 => DcpAbsoluteYCycle4(),
+               Timing.T6 =>DcpAbsoluteYCycle5(),
+               Timing.T0 => DcpAbsoluteYCycle6(),
+               Timing.TPlus => DcpAbsoluteYCycle7(),
                 _ => throw new InvalidInstructionStepException(0xDB)
             },       
             // 0xDC NOP abs, X
-            0xDC => CurrentInstructionStep switch
+            0xDC => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(),
-                2 => NopAbsoluteXCycle2(),
-                3 => NopAbsoluteXCycle3(),
-                4 => NopAbsoluteXCycle4(),
-                5 => NopAbsoluteXCycle5(),
+               Timing.T2 => NopAbsoluteXCycle1(),
+               Timing.T3 =>NopAbsoluteXCycle2(),
+               Timing.T4 => NopAbsoluteXCycle3(),
+               Timing.T5 => NopAbsoluteXCycle4(),
+               Timing.T6 =>NopAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xDC)
             },       
             // 0xDD CMP abs, X
-            0xDD => CurrentInstructionStep switch
+            0xDD => instructionTimer switch
             {
-                1 => CmpAbsoluteXCycle1(),
-                2 => CmpAbsoluteXCycle2(),
-                3 => CmpAbsoluteXCycle3(),
-                4 => CmpAbsoluteXCycle4(),
-                5 => CmpAbsoluteXCycle5(),
+               Timing.T2 => CmpAbsoluteXCycle1(),
+               Timing.T3 =>CmpAbsoluteXCycle2(),
+               Timing.T4 => CmpAbsoluteXCycle3(),
+               Timing.T5 => CmpAbsoluteXCycle4(),
+               Timing.T6 =>CmpAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xDD)
             },
             // 0xDE DEC abs, X
-            0xDE => CurrentInstructionStep switch
+            0xDE => instructionTimer switch
             {
-                1 => DecAbsoluteXCycle1(),
-                2 => DecAbsoluteXCycle2(),
-                3 => DecAbsoluteXCycle3(),
-                4 => DecAbsoluteXCycle4(),
-                5 => DecAbsoluteXCycle5(),
-                6 => DecAbsoluteXCycle6(),
-                7 => DecAbsoluteXCycle7(),
+               Timing.T2 => DecAbsoluteXCycle1(),
+               Timing.T3 =>DecAbsoluteXCycle2(),
+               Timing.T4 => DecAbsoluteXCycle3(),
+               Timing.T5 => DecAbsoluteXCycle4(),
+               Timing.T6 =>DecAbsoluteXCycle5(),
+               Timing.T0 => DecAbsoluteXCycle6(),
+               Timing.TPlus => DecAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0xDE)
             },
             // 0xDF DCP abs, X
-            0xDF => CurrentInstructionStep switch
+            0xDF => instructionTimer switch
             {
-                1 => DcpAbsoluteXCycle1(),
-                2 => DcpAbsoluteXCycle2(),
-                3 => DcpAbsoluteXCycle3(),
-                4 => DcpAbsoluteXCycle4(),
-                5 => DcpAbsoluteXCycle5(),
-                6 => DcpAbsoluteXCycle6(),
-                7 => DcpAbsoluteXCycle7(),
+               Timing.T2 => DcpAbsoluteXCycle1(),
+               Timing.T3 =>DcpAbsoluteXCycle2(),
+               Timing.T4 => DcpAbsoluteXCycle3(),
+               Timing.T5 => DcpAbsoluteXCycle4(),
+               Timing.T6 =>DcpAbsoluteXCycle5(),
+               Timing.T0 => DcpAbsoluteXCycle6(),
+               Timing.TPlus => DcpAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0xDF)
             },
             // 0xE0 CPX imm
-            0xE0 => CurrentInstructionStep switch
+            0xE0 => instructionTimer switch
             {
-                1 => CpxImmCycle1(),
-                2 => CpxImmCycle2(),
+               Timing.T2 => CpxImmCycle1(),
+               Timing.T3 =>CpxImmCycle2(),
                 _ => throw new InvalidInstructionStepException(0xE0)
             },
             // 0xE1 SBC X, ind
-            0xE1 => CurrentInstructionStep switch
+            0xE1 => instructionTimer switch
             {
-                1 => SbcIndirectXCycle1(),
-                2 => SbcIndirectXCycle2(),
-                3 => SbcIndirectXCycle3(),
-                4 => SbcIndirectXCycle4(),
-                5 => SbcIndirectXCycle5(),
-                6 => SbcIndirectXCycle6(),
+               Timing.T2 => SbcIndirectXCycle1(),
+               Timing.T3 =>SbcIndirectXCycle2(),
+               Timing.T4 => SbcIndirectXCycle3(),
+               Timing.T5 => SbcIndirectXCycle4(),
+               Timing.T6 =>SbcIndirectXCycle5(),
+               Timing.T0 => SbcIndirectXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xE1)
             },
             // 0xE2 NOP imm
-            0xE2 => CurrentInstructionStep switch
+            0xE2 => instructionTimer switch
             {
-                1 => NopImmCycle1(),
-                2 => NopImmCycle2(),
+               Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xE2)
             },
             // 0xE3 ISC x, ind
-            0xE3 => CurrentInstructionStep switch
+            0xE3 => instructionTimer switch
             {
-                1 => IscIndirectXCycle1(),
-                2 => IscIndirectXCycle2(),
-                3 => IscIndirectXCycle3(),
-                4 => IscIndirectXCycle4(),
-                5 => IscIndirectXCycle5(),
-                6 => IscIndirectXCycle6(),
-                7 => IscIndirectXCycle7(),
-                8 => IscIndirectXCycle8(),
+               Timing.T2 => IscIndirectXCycle1(),
+               Timing.T3 =>IscIndirectXCycle2(),
+               Timing.T4 => IscIndirectXCycle3(),
+               Timing.T5 => IscIndirectXCycle4(),
+               Timing.T6 =>IscIndirectXCycle5(),
+               Timing.T0 => IscIndirectXCycle6(),
+               Timing.TPlus => IscIndirectXCycle7(),
+               Timing.T8 => IscIndirectXCycle8(),
                 _ => throw new InvalidInstructionStepException(0xE3)
             },
             // 0xE4 CPX zpg
-            0xE4 => CurrentInstructionStep switch
+            0xE4 => instructionTimer switch
             {
-                1 => CpxZeropageCycle1(),
-                2 => CpxZeropageCycle2(),
-                3 => CpxZeropageCycle3(),
+               Timing.T2 => CpxZeropageCycle1(),
+               Timing.T3 =>CpxZeropageCycle2(),
+               Timing.T4 => CpxZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xE4)
             },
             // 0xE5 SBC zpg
-            0xE5 => CurrentInstructionStep switch
+            0xE5 => instructionTimer switch
             {
-                1 => SbcZeropageCycle1(),
-                2 => SbcZeropageCycle2(),
-                3 => SbcZeropageCycle3(),
+               Timing.T2 => SbcZeropageCycle1(),
+               Timing.T3 =>SbcZeropageCycle2(),
+               Timing.T4 => SbcZeropageCycle3(),
                 _ => throw new InvalidInstructionStepException(0xE5)
             },
             // 0xE6 INC zpg
-            0xE6 => CurrentInstructionStep switch
+            0xE6 => instructionTimer switch
             {
-                1 => IncZeropageCycle1(),
-                2 => IncZeropageCycle2(),
-                3 => IncZeropageCycle3(),
-                4 => IncZeropageCycle4(),
-                5 => IncZeropageCycle5(),
+               Timing.T2 => IncZeropageCycle1(),
+               Timing.T3 =>IncZeropageCycle2(),
+               Timing.T4 => IncZeropageCycle3(),
+               Timing.T5 => IncZeropageCycle4(),
+               Timing.T6 =>IncZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0xE6)
             },
             // 0xE7 ISC zpg
-            0xE7 => CurrentInstructionStep switch
+            0xE7 => instructionTimer switch
             {
-                1 => IscZeropageCycle1(),
-                2 => IscZeropageCycle2(),
-                3 => IscZeropageCycle3(),
-                4 => IscZeropageCycle4(),
-                5 => IscZeropageCycle5(),
+               Timing.T2 => IscZeropageCycle1(),
+               Timing.T3 =>IscZeropageCycle2(),
+               Timing.T4 => IscZeropageCycle3(),
+               Timing.T5 => IscZeropageCycle4(),
+               Timing.T6 =>IscZeropageCycle5(),
                 _ => throw new InvalidInstructionStepException(0xE7)
             },
             // 0xE8 INX impl
-            0xE8 => CurrentInstructionStep switch
+            0xE8 => instructionTimer switch
             {
-                1 => InxCycle1(),
-                2 => InxCycle2(),
+               Timing.T2 => InxCycle1(),
+               Timing.T3 =>InxCycle2(),
                 _ => throw new InvalidInstructionStepException(0xE8)
             },
             // 0xE9 SBC imm
-            0xE9 => CurrentInstructionStep switch
+            0xE9 => instructionTimer switch
             {
-                1 => SbcImmCycle1(),
-                2 => SbcImmCycle2(),
+                Timing.T2 | Timing.T0 => Timing.T1 | Timing.TPlus,
+                Timing.TPlus |  Timing.T1 => LogicSubtract(MemoryAddressRegister),
                 _ => throw new InvalidInstructionStepException(0xE9)
             },
             // 0xEA NOP impl
-            0xEA => CurrentInstructionStep switch
+            0xEA => instructionTimer switch
             {
-                1 => NopImpliedCycle1(),
-                2 => NopImpliedCycle2(),
+               Timing.T2 => NopImpliedCycle1(),
+               Timing.T3 =>NopImpliedCycle2(),
                 _ => throw new InvalidInstructionStepException(0xEA)
             },
             // 0xEB USBC imm
-            0xEB => CurrentInstructionStep switch
+            0xEB => instructionTimer switch
             {
-                1 => UsbcCycle1(),
-                2 => UsbcCycle2(),
+               Timing.T2 | Timing.T0 => Timing.T3,
+               Timing.T3 => LogicSubtract(MemoryDataRegister),
                 _ => throw new InvalidInstructionStepException(0xEB)
             },
             // 0xEC CPX abs
-            0xEC => CurrentInstructionStep switch
+            0xEC => instructionTimer switch
             {
-                1 => CpxAbsoluteCycle1(),
-                2 => CpxAbsoluteCycle2(),
-                3 => CpxAbsoluteCycle3(),
-                4 => CpxAbsoluteCycle4(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(Timing.T0),
+               Timing.T0 => AbsoluteCycle3(Timing.T1 | Timing.TPlus),
+               Timing.T1 | Timing.TPlus => LogicCompare(X, MemoryAddressRegister),
                 _ => throw new InvalidInstructionStepException(0xEC)
             },
             // 0xED SBC abs
-            0xED => CurrentInstructionStep switch
+            0xED => instructionTimer switch
             {
-                1 => SbcAbsoluteCycle1(),
-                2 => SbcAbsoluteCycle2(),
-                3 => SbcAbsoluteCycle3(),
-                4 => SbcAbsoluteCycle4(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(Timing.T0),
+               Timing.T0 => AbsoluteCycle3(Timing.TPlus | Timing.T1),
+               Timing.TPlus | Timing.T1 => LogicSubtract(MemoryAddressRegister),
                 _ => throw new InvalidInstructionStepException(0xED)
             },
             // 0xEE INC abs
-            0xEE => CurrentInstructionStep switch
+            0xEE => instructionTimer switch
             {
-                1 => IncAbsoluteCycle1(),
-                2 => IncAbsoluteCycle2(),
-                3 => IncAbsoluteCycle3(),
-                4 => IncAbsoluteCycle4(),
-                5 => IncAbsoluteCycle5(),
-                6 => IncAbsoluteCycle6(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 => AbsoluteCycle3(),
+               Timing.T5 => IncAbsoluteCycle4(),
+               Timing.T6 =>IncAbsoluteCycle5(),
+               Timing.T0 => IncAbsoluteCycle6(),
                 _ => throw new InvalidInstructionStepException(0xEE)
             },
             // 0xEF ISC abs
-            0xEF => CurrentInstructionStep switch
+            0xEF => instructionTimer switch
             {
-                1 => IscAbsoluteCycle1(),
-                2 => IscAbsoluteCycle2(),
-                3 => IscAbsoluteCycle3(),
-                4 => IscAbsoluteCycle4(),
-                5 => IscAbsoluteCycle5(),
-                6 => IscAbsoluteCycle6(),
+               Timing.T2 => IscAbsoluteCycle1(),
+               Timing.T3 =>IscAbsoluteCycle2(),
+               Timing.T4 => IscAbsoluteCycle3(),
+               Timing.T5 => IscAbsoluteCycle4(),
+               Timing.T6 =>IscAbsoluteCycle5(),
+               Timing.T0 => IscAbsoluteCycle6(),
                 _ => throw new InvalidInstructionStepException(0xEF)
             },
             // 0xF0 BEQ rel
-            0xF0 => CurrentInstructionStep switch
+            0xF0 => instructionTimer switch
             {
-                1 => BeqCycle1(),
-                2 => BeqCycle2(),
-                3 => BeqCycle3(),
-                4 => BeqCycle4(),
+               Timing.T2 => BeqCycle1(),
+               Timing.T3 =>BeqCycle2(),
+               Timing.T4 => BeqCycle3(),
+               Timing.T5 => BeqCycle4(),
                 _ => throw new InvalidInstructionStepException(0xF0)
             },
             // 0xF1 SBC ind, Y
-            0xF1 => CurrentInstructionStep switch
+            0xF1 => instructionTimer switch
             {
-                1 => SbcIndirectYCycle1(),
-                2 => SbcIndirectYCycle2(),
-                3 => SbcIndirectYCycle3(),
-                4 => SbcIndirectYCycle4(),
-                5 => SbcIndirectYCycle5(),
-                6 => SbcIndirectYCycle6(),
+               Timing.T2 => SbcIndirectYCycle1(),
+               Timing.T3 =>SbcIndirectYCycle2(),
+               Timing.T4 => SbcIndirectYCycle3(),
+               Timing.T5 => SbcIndirectYCycle4(),
+               Timing.T6 =>SbcIndirectYCycle5(),
+               Timing.T0 => SbcIndirectYCycle6(),
                 _ => throw new InvalidInstructionStepException(0xF1)
             },
             // 0xF2 JAM
             0xF2 => Jam(),
             // 0xF3 ISC ind, Y
-            0xF3 => CurrentInstructionStep switch
+            0xF3 => instructionTimer switch
             {
-                1 => IscIndirectYCycle1(),
-                2 => IscIndirectYCycle2(),
-                3 => IscIndirectYCycle3(),
-                4 => IscIndirectYCycle4(),
-                5 => IscIndirectYCycle5(),
-                6 => IscIndirectYCycle6(),
-                7 => IscIndirectYCycle7(),
-                8 => IscIndirectYCycle8(),
+               Timing.T2 => IscIndirectYCycle1(),
+               Timing.T3 =>IscIndirectYCycle2(),
+               Timing.T4 => IscIndirectYCycle3(),
+               Timing.T5 => IscIndirectYCycle4(),
+               Timing.T6 =>IscIndirectYCycle5(),
+               Timing.T0 => IscIndirectYCycle6(),
+               Timing.TPlus => IscIndirectYCycle7(),
+               Timing.T8 => IscIndirectYCycle8(),
                 _ => throw new InvalidInstructionStepException(0xF3)
             },
             // 0xF4 NOP zpg, X
-            0xF4 => CurrentInstructionStep switch
+            0xF4 => instructionTimer switch
             {
-                1 => NopZeropageXCycle1(),
-                2 => NopZeropageXCycle2(),
-                3 => NopZeropageXCycle3(),
-                4 => NopZeropageXCycle4(),
+               Timing.T2 => NopZeropageXCycle1(),
+               Timing.T3 =>NopZeropageXCycle2(),
+               Timing.T4 => NopZeropageXCycle3(),
+               Timing.T5 => NopZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xF4)
             },
             // 0xF5 SBC zpg, X
-            0xF5 => CurrentInstructionStep switch
+            0xF5 => instructionTimer switch
             {
-                1 => SbcZeropageXCycle1(),
-                2 => SbcZeropageXCycle2(),
-                3 => SbcZeropageXCycle3(),
-                4 => SbcZeropageXCycle4(),
+               Timing.T2 => SbcZeropageXCycle1(),
+               Timing.T3 =>SbcZeropageXCycle2(),
+               Timing.T4 => SbcZeropageXCycle3(),
+               Timing.T5 => SbcZeropageXCycle4(),
                 _ => throw new InvalidInstructionStepException(0xF5)
             },
             // 0xF6 INC zpg, X
-            0xF6 => CurrentInstructionStep switch
+            0xF6 => instructionTimer switch
             {
-                1 => IncZeropageXCycle1(),
-                2 => IncZeropageXCycle2(),
-                3 => IncZeropageXCycle3(),
-                4 => IncZeropageXCycle4(),
-                5 => IncZeropageXCycle5(),
-                6 => IncZeropageXCycle6(),
+               Timing.T2 => IncZeropageXCycle1(),
+               Timing.T3 =>IncZeropageXCycle2(),
+               Timing.T4 => IncZeropageXCycle3(),
+               Timing.T5 => IncZeropageXCycle4(),
+               Timing.T6 =>IncZeropageXCycle5(),
+               Timing.T0 => IncZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xF6)
             },
             // 0xF7 ISC zpg, X
-            0xF7 => CurrentInstructionStep switch
+            0xF7 => instructionTimer switch
             {
-                1 => IscZeropageXCycle1(),
-                2 => IscZeropageXCycle2(),
-                3 => IscZeropageXCycle3(),
-                4 => IscZeropageXCycle4(),
-                5 => IscZeropageXCycle5(),
-                6 => IscZeropageXCycle6(),
+               Timing.T2 => IscZeropageXCycle1(),
+               Timing.T3 =>IscZeropageXCycle2(),
+               Timing.T4 => IscZeropageXCycle3(),
+               Timing.T5 => IscZeropageXCycle4(),
+               Timing.T6 =>IscZeropageXCycle5(),
+               Timing.T0 => IscZeropageXCycle6(),
                 _ => throw new InvalidInstructionStepException(0xF7)
             },
             // 0xF8 SED impl
-            0xF8 => CurrentInstructionStep switch
+            0xF8 => instructionTimer switch
             {
-                1 => SedCycle1(),
-                2 => SedCycle2(),
+               Timing.T2 => SedCycle1(),
+               Timing.T3 =>SedCycle2(),
                 _ => throw new InvalidInstructionStepException(0xF8)
             },
             // 0xF9 SBC abs, Y
-            0xF9 => CurrentInstructionStep switch
+            0xF9 => instructionTimer switch
             {
-                1 => SbcAbsoluteYCycle1(),
-                2 => SbcAbsoluteYCycle2(),
-                3 => SbcAbsoluteYCycle3(),
-                4 => SbcAbsoluteYCycle4(),
-                5 => SbcAbsoluteYCycle5(),
+               Timing.T2 => SbcAbsoluteYCycle1(),
+               Timing.T3 =>SbcAbsoluteYCycle2(),
+               Timing.T4 => SbcAbsoluteYCycle3(),
+               Timing.T5 => SbcAbsoluteYCycle4(),
+               Timing.T6 =>SbcAbsoluteYCycle5(),
                 _ => throw new InvalidInstructionStepException(0xF9)
             },
             // 0xFA NOP impl
-            0xFA => CurrentInstructionStep switch
+            0xFA => instructionTimer switch
             {
-                1 => NopImpliedCycle1(),
-                2 => NopImpliedCycle2(),
+               Timing.T2 => NopImpliedCycle1(),
+               Timing.T3 =>NopImpliedCycle2(),
                 _ => throw new InvalidInstructionStepException(0xFA)
             },
             // 0xFB ISC abs, Y
-            0xFB => CurrentInstructionStep switch
+            0xFB => instructionTimer switch
             {
-                1 => IscAbsoluteYCycle1(),
-                2 => IscAbsoluteYCycle2(),
-                3 => IscAbsoluteYCycle3(),
-                4 => IscAbsoluteYCycle4(),
-                5 => IscAbsoluteYCycle5(),
-                6 => IscAbsoluteYCycle6(),
-                7 => IscAbsoluteYCycle7(),
+               Timing.T2 => IscAbsoluteYCycle1(),
+               Timing.T3 =>IscAbsoluteYCycle2(),
+               Timing.T4 => IscAbsoluteYCycle3(),
+               Timing.T5 => IscAbsoluteYCycle4(),
+               Timing.T6 =>IscAbsoluteYCycle5(),
+               Timing.T0 => IscAbsoluteYCycle6(),
+               Timing.TPlus => IscAbsoluteYCycle7(),
                 _ => throw new InvalidInstructionStepException(0xFB)
             },
             // 0xFC NOP abs, X
-            0xFC => CurrentInstructionStep switch
+            0xFC => instructionTimer switch
             {
-                1 => NopAbsoluteXCycle1(),
-                2 => NopAbsoluteXCycle2(),
-                3 => NopAbsoluteXCycle3(),
-                4 => NopAbsoluteXCycle4(),
-                5 => NopAbsoluteXCycle5(),
+               Timing.T2 => NopAbsoluteXCycle1(),
+               Timing.T3 =>NopAbsoluteXCycle2(),
+               Timing.T4 => NopAbsoluteXCycle3(),
+               Timing.T5 => NopAbsoluteXCycle4(),
+               Timing.T6 =>NopAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xFC)
             },
             // 0xFD SBC abs, X
-            0xFD => CurrentInstructionStep switch
+            0xFD => instructionTimer switch
             {
-                1 => SbcAbsoluteXCycle1(),
-                2 => SbcAbsoluteXCycle2(),
-                3 => SbcAbsoluteXCycle3(),
-                4 => SbcAbsoluteXCycle4(),
-                5 => SbcAbsoluteXCycle5(),
+               Timing.T2 => SbcAbsoluteXCycle1(),
+               Timing.T3 =>SbcAbsoluteXCycle2(),
+               Timing.T4 => SbcAbsoluteXCycle3(),
+               Timing.T5 => SbcAbsoluteXCycle4(),
+               Timing.T6 =>SbcAbsoluteXCycle5(),
                 _ => throw new InvalidInstructionStepException(0xFD)
             },
             // 0xFE INC abs, X
-            0xFE => CurrentInstructionStep switch
+            0xFE => instructionTimer switch
             {
-                1 => IncAbsoluteXCycle1(),
-                2 => IncAbsoluteXCycle2(),
-                3 => IncAbsoluteXCycle3(),
-                4 => IncAbsoluteXCycle4(),
-                5 => IncAbsoluteXCycle5(),
-                6 => IncAbsoluteXCycle6(),
-                7 => IncAbsoluteXCycle7(),
+               Timing.T2 => IncAbsoluteXCycle1(),
+               Timing.T3 =>IncAbsoluteXCycle2(),
+               Timing.T4 => IncAbsoluteXCycle3(),
+               Timing.T5 => IncAbsoluteXCycle4(),
+               Timing.T6 =>IncAbsoluteXCycle5(),
+               Timing.T0 => IncAbsoluteXCycle6(),
+               Timing.TPlus => IncAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0xFE)
             },
             // 0xFF ISC abs, X
-            0xFF => CurrentInstructionStep switch
+            0xFF => instructionTimer switch
             {
-                1 => IscAbsoluteXCycle1(),
-                2 => IscAbsoluteXCycle2(),
-                3 => IscAbsoluteXCycle3(),
-                4 => IscAbsoluteXCycle4(),
-                5 => IscAbsoluteXCycle5(),
-                6 => IscAbsoluteXCycle6(),
-                7 => IscAbsoluteXCycle7(),
+               Timing.T2 => IscAbsoluteXCycle1(),
+               Timing.T3 =>IscAbsoluteXCycle2(),
+               Timing.T4 => IscAbsoluteXCycle3(),
+               Timing.T5 => IscAbsoluteXCycle4(),
+               Timing.T6 =>IscAbsoluteXCycle5(),
+               Timing.T0 => IscAbsoluteXCycle6(),
+               Timing.TPlus => IscAbsoluteXCycle7(),
                 _ => throw new InvalidInstructionStepException(0xFF)
             },
         };
+    
+    // Functions that a lot of instructions have in common.
 
-    private ushort AlrCycle2()
+    private Timing AbsoluteCycle1()
     {
-        return 0;
+        MemoryDataDestination = MemoryDataDestination.DataPointerLow;
+        return Timing.T3;
     }
 
-    private ushort AlrCycle1()
+    private Timing AbsoluteCycle2(Timing resultTiming = Timing.T4 | Timing.SD1)
     {
-        return 0;
+        MemoryDataDestination = MemoryDataDestination.DataPointerHigh;
+        return resultTiming;
+    }
+    
+    private Timing AbsoluteCycle3(Timing resultTiming = Timing.T5 | Timing.SD2)
+    {
+        MemoryAddressRegister = DataPointer;
+        return resultTiming;
     }
 
-    // usbc
-    private ushort UsbcCycle2()
+    private Timing AbsoluteAddIndexXLow(Timing resultTiming = Timing.T5 | Timing.SD1, Timing resultTimingPageCross = Timing.SD2)
     {
-        return 0;
+        int result = DataPointerLow + X;
+        DataPointerLow = (byte)result;
+        return result > 0xFF ? resultTimingPageCross : resultTiming;
+    }
+    
+    private Timing AbsoluteAddIndexXHigh(Timing resultTiming = Timing.T0)
+    {
+        int result = DataPointerLow + X;
+        DataPointerHigh = (byte)(result >> 8);
+        return resultTiming;
     }
 
-    private ushort UsbcCycle1()
+    private Timing ZeropageCycle1(Timing resultTiming = Timing.T3 | Timing.SD1)
     {
-        return 0;
+        MemoryDataDestination = MemoryDataDestination.DataPointerLow;
+        MemoryAddressRegister &= (0x0F); // Set high nibble to 0.
+        return resultTiming;
+    }
+    
+    private Timing ZeropageCycle2(Timing resultTiming = Timing.T4 | Timing.SD2)
+    {
+        MemoryAddressRegister = DataPointer;
+        return resultTiming;
+    }
+
+    private Timing Write(ushort address, byte @value)
+    {
+        MemoryAddressRegister = address;
+        ReadPin = false;
+        MemoryDataOutputRegister = @value;
+        return LAST_CYCLE_TIMING;
+    }
+    
+    /// <summary>
+    /// Last cycle of ALR. AND the Accumulator with the contents of MDR and then perform a right shift.
+    /// Store the result in the Accumulator and the status register.
+    /// Micro ops:
+    /// A ← (A AND MDR) LSR 1
+    /// N ← 0
+    /// Z ← 1 if A is 0, otherwise 1
+    /// C ← 1 if A was odd, otherwise 0
+    /// </summary>
+    /// <returns><see cref="Timing.T2"/>, this is the last cycle.</returns>
+    private Timing AlrCycle2()
+    {
+        var (result, negative, zero, carry) = AluLogicalShiftRight(Accumulator & MemoryDataRegister);
+        Accumulator = result;
+        NegativeBit = negative;
+        ZeroBit = zero;
+        CarryBit = carry;
+        return Timing.T2;
     }
 
     // sbx
-    private ushort SbxCycle2()
+    private Timing SbxCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SbxCycle1()
+    private Timing SbxCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // isc
-    private ushort IscZeropageCycle5()
+    private Timing IscZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscZeropageCycle4()
+    private Timing IscZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscZeropageCycle3()
+    private Timing IscZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscZeropageCycle2()
+    private Timing IscZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscZeropageCycle1()
+    private Timing IscZeropageCycle1()
     {
-        return 0;
-    }
-
-
-    private ushort IscZeropageXCycle6()
-    {
-        return 0;
-    }
-    private ushort IscZeropageXCycle5()
-    {
-        return 0;
-    }
-    private ushort IscZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort IscZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort IscZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort IscZeropageXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscAbsoluteCycle6()
+
+    private Timing IscZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteCycle5()
+    private Timing IscZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteCycle4()
+    private Timing IscZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteCycle3()
+    private Timing IscZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteCycle2()
+    private Timing IscZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteCycle1()
+    private Timing IscZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscAbsoluteXCycle7()
+    private Timing IscAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteXCycle6()
+    private Timing IscAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteXCycle5()
+    private Timing IscAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteXCycle4()
+    private Timing IscAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteXCycle3()
+    private Timing IscAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteXCycle2()
+    private Timing IscAbsoluteCycle1()
     {
-        return 0;
-    }
-    private ushort IscAbsoluteXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscAbsoluteYCycle7()
+    private Timing IscAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle6()
+    private Timing IscAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle5()
+    private Timing IscAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle4()
+    private Timing IscAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle3()
+    private Timing IscAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle2()
+    private Timing IscAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscAbsoluteYCycle1()
+    private Timing IscAbsoluteXCycle1()
     {
-        return 0;
-    }
-
-    private ushort IscIndirectXCycle8()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle7()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort IscIndirectXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IscIndirectYCycle8()
+    private Timing IscAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle7()
+    private Timing IscAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle6()
+    private Timing IscAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle5()
+    private Timing IscAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle4()
+    private Timing IscAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle3()
+    private Timing IscAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle2()
+    private Timing IscAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IscIndirectYCycle1()
+
+    private Timing IscIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle7()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing IscIndirectYCycle8()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle7()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing IscIndirectYCycle1()
+    {
+        return Timing.T1;
     }
 
     // dcp
-    private ushort DcpZeropageCycle5()
+    private Timing DcpZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpZeropageCycle4()
+    private Timing DcpZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpZeropageCycle3()
+    private Timing DcpZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpZeropageCycle2()
+    private Timing DcpZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpZeropageCycle1()
+    private Timing DcpZeropageCycle1()
     {
-        return 0;
-    }
-
-
-    private ushort DcpZeropageXCycle6()
-    {
-        return 0;
-    }
-    private ushort DcpZeropageXCycle5()
-    {
-        return 0;
-    }
-    private ushort DcpZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort DcpZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort DcpZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort DcpZeropageXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DcpAbsoluteCycle6()
+
+    private Timing DcpZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteCycle5()
+    private Timing DcpZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteCycle4()
+    private Timing DcpZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteCycle3()
+    private Timing DcpZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteCycle2()
+    private Timing DcpZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteCycle1()
+    private Timing DcpZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DcpAbsoluteXCycle7()
+    private Timing DcpAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteXCycle6()
+    private Timing DcpAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteXCycle5()
+    private Timing DcpAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteXCycle4()
+    private Timing DcpAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteXCycle3()
+    private Timing DcpAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteXCycle2()
+    private Timing DcpAbsoluteCycle1()
     {
-        return 0;
-    }
-    private ushort DcpAbsoluteXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DcpAbsoluteYCycle7()
+    private Timing DcpAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle6()
+    private Timing DcpAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle5()
+    private Timing DcpAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle4()
+    private Timing DcpAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle3()
+    private Timing DcpAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle2()
+    private Timing DcpAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpAbsoluteYCycle1()
+    private Timing DcpAbsoluteXCycle1()
     {
-        return 0;
-    }
-
-    private ushort DcpIndirectXCycle8()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle7()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort DcpIndirectXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DcpIndirectYCycle8()
+    private Timing DcpAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle7()
+    private Timing DcpAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle6()
+    private Timing DcpAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle5()
+    private Timing DcpAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle4()
+    private Timing DcpAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle3()
+    private Timing DcpAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle2()
+    private Timing DcpAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DcpIndirectYCycle1()
+
+    private Timing DcpIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle7()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing DcpIndirectYCycle8()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle7()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing DcpIndirectYCycle1()
+    {
+        return Timing.T1;
     }
 
     // las
 
-    private ushort LasCycle4()
+    private Timing LasCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LasCycle3()
+    private Timing LasCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LasCycle2()
+    private Timing LasCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LasCycle1()
+    private Timing LasCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // lxa
-    private ushort LxaCycle2()
+    private Timing LxaCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LxaCycle1()
+    private Timing LxaCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // lax
 
-    private ushort LaxZeropageCycle3()
+    private Timing LaxZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxZeropageCycle2()
+    private Timing LaxZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxZeropageCycle1()
+    private Timing LaxZeropageCycle1()
     {
-        return 0;
-    }
-
-
-    private ushort LaxZeropageYCycle4()
-    {
-        return 0;
-    }
-    private ushort LaxZeropageYCycle3()
-    {
-        return 0;
-    }
-    private ushort LaxZeropageYCycle2()
-    {
-        return 0;
-    }
-    private ushort LaxZeropageYCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LaxAbsoluteCycle4()
+
+    private Timing LaxZeropageYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxAbsoluteCycle3()
+    private Timing LaxZeropageYCycle3()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing LaxZeropageYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxZeropageYCycle1()
+    {
+        return Timing.T1;
     }
 
-    private ushort LaxAbsoluteCycle2()
+    private Timing LaxAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing LaxAbsoluteCycle3()
+    {
+        return Timing.T1;
     }
 
-    private ushort LaxAbsoluteCycle1()
+    private Timing LaxAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LaxAbsoluteYCycle5()
+    private Timing LaxAbsoluteCycle1()
     {
-        return 0;
-    }
-    private ushort LaxAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort LaxAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort LaxAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort LaxAbsoluteYCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LaxIndirectXCycle6()
+    private Timing LaxAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectXCycle5()
+    private Timing LaxAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectXCycle4()
+    private Timing LaxAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectXCycle3()
+    private Timing LaxAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectXCycle2()
+    private Timing LaxAbsoluteYCycle1()
     {
-        return 0;
-    }
-    private ushort LaxIndirectXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LaxIndirectYCycle6()
+    private Timing LaxIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectYCycle5()
+    private Timing LaxIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectYCycle4()
+    private Timing LaxIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectYCycle3()
+    private Timing LaxIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectYCycle2()
+    private Timing LaxIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LaxIndirectYCycle1()
+    private Timing LaxIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
+    }
+
+    private Timing LaxIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LaxIndirectYCycle1()
+    {
+        return Timing.T1;
     }
 
     // shx
-    private ushort ShxCycle5()
+    private Timing ShxCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShxCycle4()
+    private Timing ShxCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShxCycle3()
+    private Timing ShxCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShxCycle2()
+    private Timing ShxCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShxCycle1()
+    private Timing ShxCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // shy
-    private ushort ShyCycle5()
+    private Timing ShyCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShyCycle4()
+    private Timing ShyCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShyCycle3()
+    private Timing ShyCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShyCycle2()
+    private Timing ShyCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShyCycle1()
+    private Timing ShyCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // tas
-    private ushort TasCycle5()
+    private Timing TasCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort TasCycle4()
+    private Timing TasCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort TasCycle3()
+    private Timing TasCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort TasCycle2()
+    private Timing TasCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort TasCycle1()
+    private Timing TasCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // SHA
-    private ushort ShaIndirectYCycle5()
+    private Timing ShaIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaIndirectYCycle4()
+    private Timing ShaIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaIndirectYCycle3()
+    private Timing ShaIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaIndirectYCycle2()
+    private Timing ShaIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaIndirectYCycle1()
+    private Timing ShaIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort ShaAbsoluteYCycle5()
+    private Timing ShaAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaAbsoluteYCycle4()
+    private Timing ShaAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaAbsoluteYCycle3()
+    private Timing ShaAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaAbsoluteYCycle2()
+    private Timing ShaAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ShaAbsoluteYCycle1()
+    private Timing ShaAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // JAM (illegal opcode).
-    private ushort Jam()
+    private Timing Jam() => InstructionTimer switch
     {
-        return 0;
-    }
+        Timing.T2 => Timing.T3,
+        Timing.T3 => Timing.T4,
+        Timing.T4 => Timing.T5,
+        _ => Timing.Nothing,
+    };
 
-    private ushort TyaCycle2()
+    private Timing AneCycle2()
     {
-        return 0;
-    }
-    private ushort TyaCycle1()
-    {
-        return 0;
-    }
-
-    private ushort TxsCycle2()
-    {
-        return 0;
-    }
-    private ushort TxsCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AneCycle2()
-    {
-        return 0;
-    }
-    private ushort AneCycle1()
-    {
-        return 0;
+        Accumulator = (byte)((Accumulator | 0xee | X) & MemoryDataRegister);
+        NegativeBit = (Accumulator & 0x80) == 0x80;
+        ZeroBit = Accumulator == 0;
+        return Timing.T2;
     }
 
     // NOPs (illegal opcodes).
-    private ushort NopImpliedCycle2()
+    private Timing NopImpliedCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopImpliedCycle1()
+    private Timing NopImpliedCycle1()
     {
-        return 0;
-    }
-
-    private ushort NopImmCycle2()
-    {
-        return 0;
-    }
-    private ushort NopImmCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort NopZeropageCycle3()
+
+
+    private Timing NopZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopZeropageCycle2()
+    private Timing NopZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopZeropageCycle1()
+    private Timing NopZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort NopZeropageXCycle4()
+    private Timing NopZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopZeropageXCycle3()
+    private Timing NopZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopZeropageXCycle2()
+    private Timing NopZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopZeropageXCycle1()
+    private Timing NopZeropageXCycle1()
     {
-        return 0;
-    }
-
-    private ushort NopAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort NopAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort NopAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort NopAbsoluteCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort NopAbsoluteXCycle5()
+    private Timing NopAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopAbsoluteXCycle4()
+    private Timing NopAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopAbsoluteXCycle3()
+    private Timing NopAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopAbsoluteXCycle2()
+    private Timing NopAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort NopAbsoluteXCycle1()
+    private Timing NopAbsoluteXCycle1()
     {
-        return 0;
-    }
-
-    private ushort AncCycle3()
-    {
-        return 0;
-    }
-    private ushort AncCycle2()
-    {
-        return 0;
-    }
-    private ushort AncCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort ArrCycle2()
+    private Timing AncCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ArrCycle1()
+    private Timing AncCycle2()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing AncCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing ArrCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing ArrCycle1()
+    {
+        return Timing.T1;
     }
 
     // Proper CPU instruction steps.
-    private ushort ClcCycle2()
+    private Timing ClcCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort ClcCycle1()
+    private Timing ClcCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SeiCycle2()
+    private Timing SeiCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SeiCycle1()
+    private Timing SeiCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort PlaCycle4()
+    private Timing PlaCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort PlaCycle3()
+    private Timing PlaCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort PlaCycle2()
+    private Timing PlaCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort PlaCycle1()
+    private Timing PlaCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DeyCycle2()
-    {
-        return 0;
-    }
-    private ushort DeyCycle1()
-    {
-        return 0;
-    }
-
-    private ushort TxaCycle2()
-    {
-        return 0;
-    }
-    private ushort TxaCycle1()
-    {
-        return 0;
-    }
-
-    private ushort SecCycle2()
-    {
-        return 0;
-    }
-    private ushort SecCycle1()
-    {
-        return 0;
-    }
-
-    private ushort PlpCycle4()
-    {
-        return 0;
-    }
-    private ushort PlpCycle3()
-    {
-        return 0;
-    }
-    private ushort PlpCycle2()
-    {
-        return 0;
-    }
-    private ushort PlpCycle1()
-    {
-        return 0;
-    }
-
-    private ushort PhaCycle3()
-    {
-        return 0;
-    }
-    private ushort PhaCycle2()
-    {
-        return 0;
-    }
-    private ushort PhaCycle1()
-    {
-        return 0;
-    }
-
-    private ushort DexCycle2()
-    {
-        return 0;
-    }
-    private ushort DexCycle1()
-    {
-        return 0;
-    }
-
-    private ushort InyCycle2()
-    {
-        return 0;
-    }
-    private ushort InyCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CldCycle2()
-    {
-        return 0;
-    }
-    private ushort CldCycle1()
-    {
-        return 0;
-    }
-
-    private ushort InxCycle2()
-    {
-        return 0;
-    }
-    private ushort InxCycle1()
-    {
-        return 0;
-    }
-
-    private ushort SedCycle2()
-    {
-        return 0;
-    }
-    private ushort SedCycle1()
-    {
-        return 0;
-    }
-
-    private ushort TaxCycle2()
-    {
-        return 0;
-    }
-    private ushort TaxCycle1()
-    {
-        return 0;
-    }
-
-    private ushort TsxCycle2()
-    {
-        return 0;
-    }
-    private ushort TsxCycle1()
-    {
-        return 0;
-    }
-
-    private ushort TayCycle2()
-    {
-        return 0;
-    }
-    private ushort TayCycle1()
-    {
-        return 0;
-    }
-
-    private ushort ClvCycle2()
-    {
-        return 0;
-    }
-    private ushort ClvCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CliCycle2()
-    {
-        return 0;
-    }
-    private ushort CliCycle1()
-    {
-        return 0;
-    }
-
-    private ushort PhpCycle3()
-    {
-        return 0;
-    }
-    private ushort PhpCycle2()
-    {
-        return 0;
-    }
-    private ushort PhpCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BrkCycle7()
-    {
-        return 0;
-    }
-    private ushort BrkCycle6()
-    {
-        return 0;
-    }
-    private ushort BrkCycle5()
-    {
-        return 0;
-    }
-    private ushort BrkCycle4()
-    {
-        return 0;
-    }
-    private ushort BrkCycle3()
-    {
-        return 0;
-    }
-    private ushort BrkCycle2()
-    {
-        return 0;
-    }
-    private ushort BrkCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BplCycle4()
-    {
-        return 0;
-    }
-    private ushort BplCycle3()
-    {
-        return 0;
-    }
-    private ushort BplCycle2()
-    {
-        return 0;
-    }
-    private ushort BplCycle1()
-    {
-        return 0;
-    }
-
-    private ushort JsrCycle6()
-    {
-        return 0;
-    }
-    private ushort JsrCycle5()
-    {
-        return 0;
-    }
-    private ushort JsrCycle4()
-    {
-        return 0;
-    }
-    private ushort JsrCycle3()
-    {
-        return 0;
-    }
-    private ushort JsrCycle2()
-    {
-        return 0;
-    }
-    private ushort JsrCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BmiCycle4()
-    {
-        return 0;
-    }
-    private ushort BmiCycle3()
-    {
-        return 0;
-    }
-    private ushort BmiCycle2()
-    {
-        return 0;
-    }
-    private ushort BmiCycle1()
-    {
-        return 0;
-    }
-
-    private ushort RtiCycle6()
-    {
-        return 0;
-    }
-    private ushort RtiCycle5()
-    {
-        return 0;
-    }
-    private ushort RtiCycle4()
-    {
-        return 0;
-    }
-    private ushort RtiCycle3()
-    {
-        return 0;
-    }
-    private ushort RtiCycle2()
-    {
-        return 0;
-    }
-    private ushort RtiCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BvcCycle4()
-    {
-        return 0;
-    }
-    private ushort BvcCycle3()
-    {
-        return 0;
-    }
-    private ushort BvcCycle2()
-    {
-        return 0;
-    }
-    private ushort BvcCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BvsCycle4()
-    {
-        return 0;
-    }
-    private ushort BvsCycle3()
-    {
-        return 0;
-    }
-    private ushort BvsCycle2()
-    {
-        return 0;
-    }
-    private ushort BvsCycle1()
-    {
-        return 0;
-    }
-
-
-    private ushort RtsCycle6()
-    {
-        return 0;
-    }
-    private ushort RtsCycle5()
-    {
-        return 0;
-    }
-    private ushort RtsCycle4()
-    {
-        return 0;
-    }
-    private ushort RtsCycle3()
-    {
-        return 0;
-    }
-    private ushort RtsCycle2()
-    {
-        return 0;
-    }
-    private ushort RtsCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BccCycle4()
-    {
-        return 0;
-    }
-    private ushort BccCycle3()
-    {
-        return 0;
-    }
-    private ushort BccCycle2()
-    {
-        return 0;
-    }
-    private ushort BccCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdyImmCycle2()
-    {
-        return 0;
-    }
-    private ushort LdyImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdyZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort LdyZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort LdyZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdyZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort LdyZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort LdyZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort LdyZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdyAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdyAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort LdyAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BcsCycle4()
-    {
-        return 0;
-    }
-    private ushort BcsCycle3()
-    {
-        return 0;
-    }
-    private ushort BcsCycle2()
-    {
-        return 0;
-    }
-    private ushort BcsCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpyImmCycle2()
-    {
-        return 0;
-    }
-    private ushort CpyImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpyZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort CpyZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort CpyZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpyAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort CpyAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort CpyAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort CpyAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BneCycle4()
-    {
-        return 0;
-    }
-    private ushort BneCycle3()
-    {
-        return 0;
-    }
-    private ushort BneCycle2()
-    {
-        return 0;
-    }
-    private ushort BneCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpxImmCycle2()
-    {
-        return 0;
-    }
-    private ushort CpxImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpxZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort CpxZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort CpxZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CpxAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort CpxAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort CpxAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort CpxAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort BeqCycle4()
-    {
-        return 0;
-    }
-    private ushort BeqCycle3()
-    {
-        return 0;
-    }
-    private ushort BeqCycle2()
-    {
-        return 0;
-    }
-    private ushort BeqCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraImmCycle2()
-    {
-        return 0;
-    }
-
-    private ushort OraImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort OraZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort OraZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort OraZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort OraZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort OraZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort OraAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort OraIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort OraIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort OraIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort OraIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort OraIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort OraIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort OraIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort OraIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort OraIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort OraIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort OraIndirectYCycle1()
-    {
-        return 0;
-    }
-
-
-    private ushort AndImmCycle2()
-    {
-        return 0;
-    }
-    private ushort AndImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort AndZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort AndZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort AndZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort AndZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort AndZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort AndAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort AndIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort AndIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort AndIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort AndIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort AndIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort AndIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort AndIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort AndIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort AndIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort AndIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort AndIndirectYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorImmCycle2()
-    {
-        return 0;
-    }
-    private ushort EorImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort EorZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort EorZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort EorZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort EorZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort EorZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort EorAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort EorIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort EorIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort EorIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort EorIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort EorIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort EorIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort EorIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort EorIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort EorIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort EorIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort EorIndirectYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort StaZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort StaZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort StaZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort StaZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort StaZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort StaAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort StaIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort StaIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort StaIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort StaIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort StaIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort StaIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort StaIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort StaIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort StaIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort StaIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort StaIndirectYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaImmCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaAbsoluteYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort LdaIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectXCycle1()
-    {
-        return 0;
-    }
 
-    private ushort LdaIndirectYCycle6()
+    private Timing SecCycle2()
     {
-        return 0;
+        CarryBit = true;
+        return Timing.T2;
     }
-    private ushort LdaIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort LdaIndirectYCycle1()
-    {
-        return 0;
-    }
-
-
-
-    private ushort CmpImmCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpImmCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpZeropageCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort CmpZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpZeropageXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteYCycle4()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteYCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteYCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpAbsoluteYCycle1()
-    {
-        return 0;
-    }
+    private Timing SecCycle1() => Timing.TPlus | Timing.T1;
 
-    private ushort CmpIndirectXCycle6()
+    private Timing PlpCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort CmpIndirectXCycle5()
+    private Timing PlpCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort CmpIndirectXCycle4()
+    private Timing PlpCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort CmpIndirectXCycle3()
+    private Timing PlpCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort CmpIndirectXCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectXCycle1()
-    {
-        return 0;
-    }
-
-    private ushort CmpIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectYCycle2()
-    {
-        return 0;
-    }
-    private ushort CmpIndirectYCycle1()
-    {
-        return 0;
-    }
-
-    private ushort SbcImmCycle2()
-    {
-        CpuAdd(-(sbyte)DataLatch);
-        return 0;
-    }
-    private ushort SbcImmCycle1()
-    {
-        LoadNextOpcodeByte();
-        return 2;
-    }
-
-    private ushort SbcZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort SbcZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort SbcZeropageCycle1()
-    {
-        return 0;
-    }
 
-    private ushort SbcZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort SbcZeropageXCycle3()
+    private Timing PhaCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SbcZeropageXCycle2()
+    private Timing PhaCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SbcZeropageXCycle1()
+    private Timing PhaCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SbcAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteCycle2()
+    private Timing DexCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SbcAbsoluteCycle1()
+    private Timing DexCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SbcAbsoluteXCycle5()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteXCycle4()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteXCycle3()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteXCycle2()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteXCycle1()
+    private Timing DeyCycle2()
     {
-        return 0;
+        var (result, negative, zero, _, _) = AluAdd(Y, -1, false);
+        Y = result;
+        NegativeBit = negative;
+        ZeroBit = zero;
+        return Timing.T2;
     }
 
-    private ushort SbcAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort SbcAbsoluteYCycle4()
-    {
-        return 5;
-    }
-    private ushort SbcAbsoluteYCycle3()
-    {
-        return 4;
-    }
-    private ushort SbcAbsoluteYCycle2()
+    private Timing InyCycle2()
     {
-        EffectiveAddress |= (ushort)(LoadNextOpcodeByte() << 8);
-        return 3;
+        return Timing.T1;
     }
-    private ushort SbcAbsoluteYCycle1()
+    private Timing InyCycle1()
     {
-        EffectiveAddress = 0;
-        EffectiveAddress |= LoadNextOpcodeByte();
-        return 2;
+        return Timing.T1;
     }
 
-    private ushort SbcIndirectXCycle6()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectXCycle5()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectXCycle4()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectXCycle3()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectXCycle2()
+    private Timing CldCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SbcIndirectXCycle1()
+    private Timing CldCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SbcIndirectYCycle6()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectYCycle5()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectYCycle4()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectYCycle3()
-    {
-        return 0;
-    }
-    private ushort SbcIndirectYCycle2()
+    private Timing InxCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SbcIndirectYCycle1()
+    private Timing InxCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LdxImmCycle2()
+    private Timing SedCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxImmCycle1()
+    private Timing SedCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LdxZeropageYCycle1()
+    private Timing TransferLastCycle(byte @value, DestinationRegister destinationRegister)
     {
-        return 0;
+        var (result, zero, negative, _, __) = AluAdd(@value, 0, false);
+        switch (destinationRegister)
+        {
+            case DestinationRegister.IndexX:
+                X = result;
+                NegativeBit = negative;
+                ZeroBit = zero;
+                break;
+            case DestinationRegister.IndexY:
+                Y = result;
+                NegativeBit = negative;
+                ZeroBit = zero;
+                break;
+            case DestinationRegister.Accumulator:
+                Accumulator = result;
+                NegativeBit = negative;
+                ZeroBit = zero;
+                break;
+            case DestinationRegister.StackPointer:
+                StackPointer = result;
+                break;
+        }
+        return Timing.T2;
     }
     
-    private ushort LdxZeropageYCycle2()
+    private Timing ClvCycle2()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing ClvCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CliCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CliCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing PhpCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing PhpCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing PhpCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BrkCycle7()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BrkCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BplCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BplCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BplCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BplCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing JsrCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing JsrCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing JsrCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing JsrCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing JsrCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing JsrCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BmiCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BmiCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BmiCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BmiCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing RtiCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing RtiCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing RtiCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing RtiCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing RtiCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing RtiCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BvcCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BvcCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BvcCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BvcCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BvsCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BvsCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BvsCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BvsCycle1()
+    {
+        return Timing.T1;
+    }
+
+
+    private Timing RtsCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing RtsCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing RtsCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing RtsCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing RtsCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing RtsCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BccCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BccCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BccCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BccCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdyImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdyZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdyZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdyAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdyAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdyAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BcsCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BcsCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BcsCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BcsCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CpyImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CpyZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CpyAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CpyAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BneCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BneCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BneCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BneCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CpxImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CpxImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CpxZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CpxZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CpxZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BeqCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing BeqCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing BeqCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing BeqCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing OraZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraLastCycle()
+    {
+        var (result, zero, negative) = AluOr(Accumulator, MemoryDataRegister);
+        Accumulator = result;
+        ZeroBit = zero;
+        NegativeBit = negative;
+        return Timing.T2;
+    }
+
+    private Timing OraAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing OraIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing OraIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+
+
+    private Timing AndZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing AndZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing AndZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing AndAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing AndAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing AndIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing AndIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing AndIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing EorIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing EorIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing StaIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing StaIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    /// <summary>
+    ///  Set A to the data latch. Set Z and N according the values in A.
+    /// A ← MDR
+    /// Z ← A = 0
+    /// N ← A gt 0
+    /// </summary>
+    /// <returns>T2. The instruction is complete.</returns>
+    private Timing LdaImmCycle2()
+    {
+        Accumulator = MemoryDataRegister;
+        NegativeBit = Accumulator > 0;
+        ZeroBit = Accumulator == 0;
+        return Timing.T2;
+    }
+
+    private Timing LdaZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdaIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdaIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+
+
+    private Timing CmpImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpAbsoluteCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpAbsoluteYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpAbsoluteYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing CmpIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing CmpIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+
+    private Timing SbcZeropageCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcZeropageCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcZeropageCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing SbcZeropageXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcZeropageXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcZeropageXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcZeropageXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing SbcAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing SbcIndirectXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing SbcIndirectYCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectYCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectYCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectYCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectYCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing SbcIndirectYCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdxImmCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing LdxImmCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing LdxZeropageYCycle1()
+    {
+        return Timing.T1;
     }
     
-    private ushort LdxZeropageYCycle3()
+    private Timing LdxZeropageYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
     
-    private ushort LdxZeropageYCycle4()
+    private Timing LdxZeropageYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-
-    private ushort LdxZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort LdxZeropageCycle2()
+    
+    private Timing LdxZeropageYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxZeropageCycle1()
-    {
-        return 0;
-    }
 
-
-    private ushort LdxAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort LdxAbsoluteCycle3()
+    private Timing LdxZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxAbsoluteCycle2()
+    private Timing LdxZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxAbsoluteCycle1()
+    private Timing LdxZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LdxAbsoluteYCycle5()
-    {
-        return 0;
-    }
-    private ushort LdxAbsoluteYCycle4()
+
+    private Timing LdxAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxAbsoluteYCycle3()
+    private Timing LdxAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxAbsoluteYCycle2()
+    private Timing LdxAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LdxAbsoluteYCycle1()
+    private Timing LdxAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort BitZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort BitZeropageCycle2()
-    {
-        return 0;
-    }
-    private ushort BitZeropageCycle1()
+    private Timing LdxAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-
-    private ushort BitAbsoluteCycle4()
+    private Timing LdxAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort BitAbsoluteCycle3()
+    private Timing LdxAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort BitAbsoluteCycle2()
+    private Timing LdxAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort BitAbsoluteCycle1()
+    private Timing LdxAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StyZeropageCycle3()
+    private Timing BitZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyZeropageCycle2()
+    private Timing BitZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyZeropageCycle1()
+    private Timing BitZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StyZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort StyZeropageXCycle3()
+    private Timing StyZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyZeropageXCycle2()
+    private Timing StyZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyZeropageXCycle1()
+    private Timing StyZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StyAbsoluteCycle4()
+    private Timing StyZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyAbsoluteCycle3()
+    private Timing StyZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyAbsoluteCycle2()
+    private Timing StyZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StyAbsoluteCycle1()
+    private Timing StyZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcImmCycle2()
+    private Timing StyAbsoluteCycle4()
     {
-        CpuAdd(DataLatch);
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcImmCycle1()
+    private Timing StyAbsoluteCycle3()
     {
-        LoadNextOpcodeByte();
-        return 2;
+        return Timing.T1;
     }
-
-    private ushort AdcZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort AdcZeropageCycle2()
+    private Timing StyAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcZeropageCycle1()
+    private Timing StyAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort AdcZeropageXCycle3()
+    private Timing AdcZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcZeropageXCycle2()
+    private Timing AdcZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcZeropageXCycle1()
+    private Timing AdcZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcAbsoluteCycle4()
+    private Timing AdcZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteCycle3()
+    private Timing AdcZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteCycle2()
+    private Timing AdcZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteCycle1()
+    private Timing AdcZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcAbsoluteXCycle5()
+    private Timing AdcAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteXCycle4()
+    private Timing AdcAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteXCycle3()
+    private Timing AdcAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteXCycle2()
+    private Timing AdcAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteXCycle1()
+    private Timing AdcAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcAbsoluteYCycle5()
+    private Timing AdcAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteYCycle4()
+    private Timing AdcAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteYCycle3()
+    private Timing AdcAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteYCycle2()
+    private Timing AdcAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcAbsoluteYCycle1()
+    private Timing AdcAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcIndirectXCycle6()
+    private Timing AdcIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectXCycle5()
+    private Timing AdcIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectXCycle4()
+    private Timing AdcIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectXCycle3()
+    private Timing AdcIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectXCycle2()
+    private Timing AdcIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectXCycle1()
+    private Timing AdcIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AdcIndirectYCycle6()
+    private Timing AdcIndirectYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectYCycle5()
+    private Timing AdcIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectYCycle4()
+    private Timing AdcIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectYCycle3()
+    private Timing AdcIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectYCycle2()
+    private Timing AdcIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AdcIndirectYCycle1()
+    private Timing AdcIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AslAccumCycle2()
+    private Timing AslAccumCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAccumCycle1()
+    private Timing AslAccumCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AslZeropageCycle5()
+    private Timing AslZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageCycle4()
+    private Timing AslZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageCycle3()
+    private Timing AslZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageCycle2()
+    private Timing AslZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageCycle1()
+    private Timing AslZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AslZeropageXCycle6()
+    private Timing AslZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageXCycle5()
+    private Timing AslZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageXCycle4()
+    private Timing AslZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageXCycle3()
+    private Timing AslZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageXCycle2()
+    private Timing AslZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslZeropageXCycle1()
+    private Timing AslZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort AslAbsoluteCycle6()
-    {
-        return 0;
-    }
-    private ushort AslAbsoluteCycle5()
-    {
-        return 0;
-    }
-    private ushort AslAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort AslAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort AslAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort AslAbsoluteCycle1()
+
+    private Timing AslAbsoluteCycle4()
     {
-        return 0;
+        var (result, carry, zero, overflow) = AluAsl(MemoryDataRegister);
+        TempRegister = result;
+        CarryBit = carry;
+        ZeroBit = zero;
+        OverflowBit = overflow;
+        return Timing.T0;
     }
 
-    private ushort AslAbsoluteXCycle7()
+    private Timing AslAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle6()
+    private Timing AslAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle5()
+    private Timing AslAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle4()
+    private Timing AslAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle3()
+    private Timing AslAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle2()
+    private Timing AslAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort AslAbsoluteXCycle1()
+    private Timing AslAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RolAccumCycle2()
+    private Timing RolAccumCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAccumCycle1()
+    private Timing RolAccumCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RolZeropageCycle5()
-    {
-        return 0;
-    }
-    private ushort RolZeropageCycle4()
-    {
-        return 0;
-    }
-    private ushort RolZeropageCycle3()
-    {
-        return 0;
-    }
-    private ushort RolZeropageCycle2()
+    private Timing RolZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageCycle1()
+    private Timing RolZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-
-    private ushort RolZeropageXCycle6()
+    private Timing RolZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageXCycle5()
+    private Timing RolZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageXCycle4()
+    private Timing RolZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageXCycle3()
+    private Timing RolZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageXCycle2()
+    private Timing RolZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolZeropageXCycle1()
+    private Timing RolZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RolAbsoluteCycle6()
-    {
-        return 0;
-    }
-    private ushort RolAbsoluteCycle5()
-    {
-        return 0;
-    }
-    private ushort RolAbsoluteCycle4()
+    private Timing RolCycle()
     {
-        return 0;
+        var (result, negative, zero, carry) = AluRotateLeft(MemoryDataRegister);
+        TempRegister = result;
+        NegativeBit = negative;
+        ZeroBit = zero;
+        CarryBit = carry;
+        return Timing.T0;
     }
-    private ushort RolAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort RolAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort RolAbsoluteCycle1()
-    {
-        return 0;
-    }
 
-    private ushort RolAbsoluteXCycle7()
+    private Timing RolAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle6()
+    private Timing RolAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle5()
+    private Timing RolAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle4()
+    private Timing RolAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle3()
+    private Timing RolAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle2()
+    private Timing RolAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RolAbsoluteXCycle1()
+    private Timing RolAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RorAccumCycle2()
+    private Timing RorAccumCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAccumCycle1()
+    private Timing RorAccumCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RorZeropageCycle5()
+    private Timing RorZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageCycle4()
+    private Timing RorZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageCycle3()
+    private Timing RorZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageCycle2()
+    private Timing RorZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageCycle1()
+    private Timing RorZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RorZeropageXCycle6()
+    private Timing RorZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageXCycle5()
+    private Timing RorZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageXCycle4()
+    private Timing RorZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageXCycle3()
+    private Timing RorZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageXCycle2()
+    private Timing RorZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorZeropageXCycle1()
+    private Timing RorZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RorAbsoluteCycle6()
+    private Timing RorAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteCycle5()
+    private Timing RorAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteCycle4()
+    private Timing RorAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteCycle3()
+    private Timing RorAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteCycle2()
+    private Timing RorAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteCycle1()
+    private Timing RorAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RorAbsoluteXCycle7()
+    private Timing RorAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle6()
+    private Timing RorAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle5()
+    private Timing RorAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle4()
+    private Timing RorAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle3()
+    private Timing RorAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle2()
+    private Timing RorAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RorAbsoluteXCycle1()
+    private Timing RorAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloAbsoluteCycle6()
-    {
-        return 0;
-    }
-    private ushort SloAbsoluteCycle5()
-    {
-        return 0;
-    }
-    private ushort SloAbsoluteCycle4()
-    {
-        return 0;
-    }
-    private ushort SloAbsoluteCycle3()
-    {
-        return 0;
-    }
-    private ushort SloAbsoluteCycle2()
-    {
-        return 0;
-    }
-    private ushort SloAbsoluteCycle1()
+    private Timing SloAbsoluteCycle5()
     {
-        return 0;
+        var (result, _, __, ___) = AluAsl(MemoryDataRegister);
+        TempRegister = result;
+        var (result2, zero, negative) = AluOr(Accumulator, result);
+        ZeroBit = zero;
+        NegativeBit = negative;
+        return Timing.TPlus | Timing.T1;
     }
 
-    private ushort SloAbsoluteXCycle7()
+    private Timing SloAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle6()
+    private Timing SloAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle5()
+    private Timing SloAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle4()
+    private Timing SloAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle3()
+    private Timing SloAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle2()
+    private Timing SloAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteXCycle1()
+    private Timing SloAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloAbsoluteYCycle7()
+    private Timing SloAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle6()
+    private Timing SloAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle5()
+    private Timing SloAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle4()
+    private Timing SloAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle3()
+    private Timing SloAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle2()
+    private Timing SloAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloAbsoluteYCycle1()
+    private Timing SloAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloZeropageCycle5()
+    private Timing SloZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloZeropageCycle4()
+    private Timing SloZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloZeropageCycle3()
+    private Timing SloZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloZeropageCycle2()
+    private Timing SloZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloZeropageCycle1()
+    private Timing SloZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloIndirectXCycle8()
+    private Timing SloIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle7()
+    private Timing SloIndirectXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloIndirectXCycle6()
+    private Timing SloIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle5()
+    private Timing SloIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle4()
+    private Timing SloIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle3()
+    private Timing SloIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle2()
+    private Timing SloIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectXCycle1()
+    private Timing SloIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloIndirectYCycle8()
+    private Timing SloIndirectYCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle7()
+    private Timing SloIndirectYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SloIndirectYCycle6()
+    private Timing SloIndirectYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle5()
+    private Timing SloIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle4()
+    private Timing SloIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle3()
+    private Timing SloIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle2()
+    private Timing SloIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SloIndirectYCycle1()
+    private Timing SloIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaAbsoluteCycle6()
+    private Timing RlaAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteCycle5()
+    private Timing RlaAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteCycle4()
+    private Timing RlaAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteCycle3()
+    private Timing RlaAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteCycle2()
+    private Timing RlaAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteCycle1()
+    private Timing RlaAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaAbsoluteXCycle7()
+    private Timing RlaAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle6()
+    private Timing RlaAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle5()
+    private Timing RlaAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle4()
+    private Timing RlaAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle3()
+    private Timing RlaAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle2()
+    private Timing RlaAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteXCycle1()
+    private Timing RlaAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaAbsoluteYCycle7()
+    private Timing RlaAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle6()
+    private Timing RlaAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle5()
+    private Timing RlaAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle4()
+    private Timing RlaAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle3()
+    private Timing RlaAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle2()
+    private Timing RlaAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaAbsoluteYCycle1()
+    private Timing RlaAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaZeropageCycle5()
+    private Timing RlaZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageCycle4()
+    private Timing RlaZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageCycle3()
+    private Timing RlaZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageCycle2()
+    private Timing RlaZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageCycle1()
+    private Timing RlaZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaZeropageXCycle6()
+    private Timing RlaZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageXCycle5()
+    private Timing RlaZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageXCycle4()
+    private Timing RlaZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageXCycle3()
+    private Timing RlaZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageXCycle2()
+    private Timing RlaZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaZeropageXCycle1()
+    private Timing RlaZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaIndirectXCycle8()
+    private Timing RlaIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle7()
+    private Timing RlaIndirectXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaIndirectXCycle6()
+    private Timing RlaIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle5()
+    private Timing RlaIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle4()
+    private Timing RlaIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle3()
+    private Timing RlaIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle2()
+    private Timing RlaIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectXCycle1()
+    private Timing RlaIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaIndirectYCycle8()
+    private Timing RlaIndirectYCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle7()
+    private Timing RlaIndirectYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RlaIndirectYCycle6()
+    private Timing RlaIndirectYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle5()
+    private Timing RlaIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle4()
+    private Timing RlaIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle3()
+    private Timing RlaIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle2()
+    private Timing RlaIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RlaIndirectYCycle1()
+    private Timing RlaIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreAbsoluteCycle6()
+    private Timing SreAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteCycle5()
+    private Timing SreAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteCycle4()
+    private Timing SreAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteCycle3()
+    private Timing SreAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteCycle2()
+    private Timing SreAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteCycle1()
+    private Timing SreAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreAbsoluteXCycle7()
+    private Timing SreAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle6()
+    private Timing SreAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle5()
+    private Timing SreAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle4()
+    private Timing SreAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle3()
+    private Timing SreAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle2()
+    private Timing SreAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteXCycle1()
+    private Timing SreAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreAbsoluteYCycle7()
+    private Timing SreAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle6()
+    private Timing SreAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle5()
+    private Timing SreAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle4()
+    private Timing SreAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle3()
+    private Timing SreAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle2()
+    private Timing SreAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreAbsoluteYCycle1()
+    private Timing SreAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreZeropageCycle5()
+    private Timing SreZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageCycle4()
+    private Timing SreZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageCycle3()
+    private Timing SreZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageCycle2()
+    private Timing SreZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageCycle1()
+    private Timing SreZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreZeropageXCycle6()
+    private Timing SreZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageXCycle5()
+    private Timing SreZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageXCycle4()
+    private Timing SreZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageXCycle3()
+    private Timing SreZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageXCycle2()
+    private Timing SreZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreZeropageXCycle1()
+    private Timing SreZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
 
-    private ushort SreIndirectXCycle8()
+    private Timing SreIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle7()
+    private Timing SreIndirectXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle6()
+    private Timing SreIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle5()
+    private Timing SreIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle4()
+    private Timing SreIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle3()
+    private Timing SreIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle2()
+    private Timing SreIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectXCycle1()
+    private Timing SreIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SreIndirectYCycle8()
+    private Timing SreIndirectYCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle7()
+    private Timing SreIndirectYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle6()
+    private Timing SreIndirectYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle5()
+    private Timing SreIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle4()
+    private Timing SreIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle3()
+    private Timing SreIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle2()
+    private Timing SreIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SreIndirectYCycle1()
+    private Timing SreIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LsrAccumCycle2()
+    private Timing LsrAccumCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAccumCycle1()
+    private Timing LsrAccumCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LsrZeropageCycle5()
+    private Timing LsrZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageCycle4()
+    private Timing LsrZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageCycle3()
+    private Timing LsrZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageCycle2()
+    private Timing LsrZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageCycle1()
+    private Timing LsrZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LsrZeropageXCycle6()
+    private Timing LsrZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageXCycle5()
+    private Timing LsrZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageXCycle4()
+    private Timing LsrZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageXCycle3()
+    private Timing LsrZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageXCycle2()
+    private Timing LsrZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrZeropageXCycle1()
+    private Timing LsrZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LsrAbsoluteCycle6()
+    private Timing LsrAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteCycle5()
+    private Timing LsrAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteCycle4()
+    private Timing LsrAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteCycle3()
+    private Timing LsrAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteCycle2()
+    private Timing LsrAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteCycle1()
+    private Timing LsrAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort LsrAbsoluteXCycle7()
+    private Timing LsrAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle6()
+    private Timing LsrAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle5()
+    private Timing LsrAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle4()
+    private Timing LsrAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle3()
+    private Timing LsrAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle2()
+    private Timing LsrAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort LsrAbsoluteXCycle1()
+    private Timing LsrAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraAbsoluteCycle6()
+    private Timing RraAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteCycle5()
+    private Timing RraAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteCycle4()
+    private Timing RraAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteCycle3()
+    private Timing RraAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteCycle2()
+    private Timing RraAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteCycle1()
+    private Timing RraAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraAbsoluteXCycle7()
+    private Timing RraAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle6()
+    private Timing RraAbsoluteXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle5()
+    private Timing RraAbsoluteXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle4()
+    private Timing RraAbsoluteXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle3()
+    private Timing RraAbsoluteXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle2()
+    private Timing RraAbsoluteXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteXCycle1()
+    private Timing RraAbsoluteXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraAbsoluteYCycle7()
+    private Timing RraAbsoluteYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle6()
+    private Timing RraAbsoluteYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle5()
+    private Timing RraAbsoluteYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle4()
+    private Timing RraAbsoluteYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle3()
+    private Timing RraAbsoluteYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle2()
+    private Timing RraAbsoluteYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraAbsoluteYCycle1()
+    private Timing RraAbsoluteYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraZeropageCycle5()
+    private Timing RraZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageCycle4()
+    private Timing RraZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageCycle3()
+    private Timing RraZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageCycle2()
+    private Timing RraZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageCycle1()
+    private Timing RraZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraZeropageXCycle6()
+    private Timing RraZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageXCycle5()
+    private Timing RraZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageXCycle4()
+    private Timing RraZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageXCycle3()
+    private Timing RraZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageXCycle2()
+    private Timing RraZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraZeropageXCycle1()
+    private Timing RraZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraIndirectXCycle8()
+    private Timing RraIndirectXCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle7()
+    private Timing RraIndirectXCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraIndirectXCycle6()
+    private Timing RraIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle5()
+    private Timing RraIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle4()
+    private Timing RraIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle3()
+    private Timing RraIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle2()
+    private Timing RraIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectXCycle1()
+    private Timing RraIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraIndirectYCycle8()
+    private Timing RraIndirectYCycle8()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle7()
+    private Timing RraIndirectYCycle7()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort RraIndirectYCycle6()
+    private Timing RraIndirectYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle5()
+    private Timing RraIndirectYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle4()
+    private Timing RraIndirectYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle3()
+    private Timing RraIndirectYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle2()
+    private Timing RraIndirectYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort RraIndirectYCycle1()
+    private Timing RraIndirectYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort JmpAbsoluteCycle4()
+    private Timing JmpAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpAbsoluteCycle3()
+    private Timing JmpAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpAbsoluteCycle2()
+    private Timing JmpAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpAbsoluteCycle1()
+    private Timing JmpAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort JmpIndirectCycle5()
+    private Timing JmpIndirectCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpIndirectCycle4()
+    private Timing JmpIndirectCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpIndirectCycle3()
+    private Timing JmpIndirectCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpIndirectCycle2()
+    private Timing JmpIndirectCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort JmpIndirectCycle1()
+    private Timing JmpIndirectCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SaxAbsoluteCycle4()
+    private Timing SaxAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxAbsoluteCycle3()
+    private Timing SaxAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxAbsoluteCycle2()
+    private Timing SaxAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxAbsoluteCycle1()
+    private Timing SaxAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
 
-    private ushort SaxZeropageCycle3()
+    private Timing SaxZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageCycle2()
+    private Timing SaxZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageCycle1()
+    private Timing SaxZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SaxZeropageYCycle6()
+    private Timing SaxZeropageYCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageYCycle5()
+    private Timing SaxZeropageYCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageYCycle4()
+    private Timing SaxZeropageYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageYCycle3()
+    private Timing SaxZeropageYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageYCycle2()
+    private Timing SaxZeropageYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxZeropageYCycle1()
+    private Timing SaxZeropageYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort SaxIndirectXCycle6()
+    private Timing SaxIndirectXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxIndirectXCycle5()
+    private Timing SaxIndirectXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxIndirectXCycle4()
+    private Timing SaxIndirectXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxIndirectXCycle3()
+    private Timing SaxIndirectXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxIndirectXCycle2()
+    private Timing SaxIndirectXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort SaxIndirectXCycle1()
+    private Timing SaxIndirectXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StxZeropageCycle3()
+    private Timing StxZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxZeropageCycle2()
+    private Timing StxZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxZeropageCycle1()
+    private Timing StxZeropageCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StxZeropageYCycle4()
+    private Timing StxZeropageYCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxZeropageYCycle3()
+    private Timing StxZeropageYCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxZeropageYCycle2()
+    private Timing StxZeropageYCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxZeropageYCycle1()
+    private Timing StxZeropageYCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort StxAbsoluteCycle4()
+    private Timing StxAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxAbsoluteCycle3()
+    private Timing StxAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxAbsoluteCycle2()
+    private Timing StxAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort StxAbsoluteCycle1()
+    private Timing StxAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
     // DEC
-    private ushort DecZeropageCycle5()
+    private Timing DecZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecZeropageCycle4()
+    private Timing DecZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecZeropageCycle3()
+    private Timing DecZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecZeropageCycle2()
+    private Timing DecZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecZeropageCycle1()
+    private Timing DecZeropageCycle1()
     {
-        return 0;
-    }
-
-
-    private ushort DecZeropageXCycle6()
-    {
-        return 0;
-    }
-    private ushort DecZeropageXCycle5()
-    {
-        return 0;
-    }
-    private ushort DecZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort DecZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort DecZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort DecZeropageXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DecAbsoluteCycle6()
+
+    private Timing DecZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteCycle5()
+    private Timing DecZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteCycle4()
+    private Timing DecZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteCycle3()
+    private Timing DecZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteCycle2()
+    private Timing DecZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteCycle1()
+    private Timing DecZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort DecAbsoluteXCycle7()
+    private Timing DecAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle6()
+    private Timing DecAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle5()
+    private Timing DecAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle4()
+    private Timing DecAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle3()
+    private Timing DecAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle2()
+    private Timing DecAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort DecAbsoluteXCycle1()
+
+    private Timing DecAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing DecAbsoluteXCycle1()
+    {
+        return Timing.T1;
     }
 
     // INC
-    private ushort IncZeropageCycle5()
+    private Timing IncZeropageCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncZeropageCycle4()
+    private Timing IncZeropageCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncZeropageCycle3()
+    private Timing IncZeropageCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncZeropageCycle2()
+    private Timing IncZeropageCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncZeropageCycle1()
+    private Timing IncZeropageCycle1()
     {
-        return 0;
-    }
-
-
-    private ushort IncZeropageXCycle6()
-    {
-        return 0;
-    }
-    private ushort IncZeropageXCycle5()
-    {
-        return 0;
-    }
-    private ushort IncZeropageXCycle4()
-    {
-        return 0;
-    }
-    private ushort IncZeropageXCycle3()
-    {
-        return 0;
-    }
-    private ushort IncZeropageXCycle2()
-    {
-        return 0;
-    }
-    private ushort IncZeropageXCycle1()
-    {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IncAbsoluteCycle6()
+
+    private Timing IncZeropageXCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteCycle5()
+    private Timing IncZeropageXCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteCycle4()
+    private Timing IncZeropageXCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteCycle3()
+    private Timing IncZeropageXCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteCycle2()
+    private Timing IncZeropageXCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteCycle1()
+    private Timing IncZeropageXCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
 
-    private ushort IncAbsoluteXCycle7()
+    private Timing IncAbsoluteCycle6()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle6()
+    private Timing IncAbsoluteCycle5()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle5()
+    private Timing IncAbsoluteCycle4()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle4()
+    private Timing IncAbsoluteCycle3()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle3()
+    private Timing IncAbsoluteCycle2()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle2()
+    private Timing IncAbsoluteCycle1()
     {
-        return 0;
+        return Timing.T1;
     }
-    private ushort IncAbsoluteXCycle1()
+
+    private Timing IncAbsoluteXCycle7()
     {
-        return 0;
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle6()
+    {
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle5()
+    {
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle4()
+    {
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle3()
+    {
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle2()
+    {
+        return Timing.T1;
+    }
+    private Timing IncAbsoluteXCycle1()
+    {
+        return Timing.T1;
+    }
+
+    private Timing BitLastCycle()
+    {
+        NegativeBit = (MemoryDataRegister & 0x80) == 0x80;
+        OverflowBit = (MemoryDataRegister & 0x40) == 0x40;
+        ZeroBit = (MemoryDataRegister & Accumulator) == 0;
+        return Timing.T2;
     }
 }
