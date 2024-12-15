@@ -323,6 +323,12 @@ public class Mos6502(in IMemory memory)
         int result = (byte)(a << 1) | (byte)(a >> (8 - 1));
         return ((byte)result, (result & 0x80) == 0x80, result == 0, (a & 0x80) == 0x80);
     }
+
+    public (bool, bool, bool) AluCompare(int a, int b)
+    {
+        var (_, negative, zero, carry, __) = AluAdd(a, -b, false);
+        return (negative, zero, carry);
+    }
     
     private void SetupReadFor(ushort address)
     {
@@ -367,16 +373,15 @@ public class Mos6502(in IMemory memory)
     /// <returns><see cref="Timing.T2"/>, as this is always the last operation in an instruction.</returns>
     private Timing LogicSubtract(int b) => LogicAdd(-b);
 
-    private Timing LogicCompare(int a, int b)
+    private void LogicCompare(int a, int b)
     {
-        var (_, negative, zero, carry, _) = AluAdd(a, -b, false);
+        var (negative, zero, carry) = AluCompare(a, b);
         CarryBit = carry;
         ZeroBit = zero;
         NegativeBit = negative;
-        return Timing.T2;
     }
 
-    public Timing LogicAnd(int a)
+    private Timing LogicAnd(int a)
     {
         var (result, negative, zero) = AluAnd(Accumulator, a);
         Accumulator = result;
@@ -447,9 +452,9 @@ public class Mos6502(in IMemory memory)
             // NOP zeropage (illegal)
             0x4 => instructionTimer switch
             {
-               Timing.T2 => NopZeropageCycle1(),
-               Timing.T3 =>NopZeropageCycle2(),
-               Timing.T4 => NopZeropageCycle3(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T0 => ZeropageRead(),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x4)
             },
             // ORA zeropage
@@ -463,11 +468,11 @@ public class Mos6502(in IMemory memory)
             // ASL zeropage
             0x6 => instructionTimer switch
             {
-               Timing.T2 => AslZeropageCycle1(),
-               Timing.T3 =>AslZeropageCycle2(),
-               Timing.T4 => AslZeropageCycle3(),
-               Timing.T5 => AslZeropageCycle4(),
-               Timing.T6 =>AslZeropageCycle5(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 | Timing.SD1 => ZeropageRead(),
+               Timing.T4 | Timing.SD2 => Asl(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0x6)
             },
             // SLO zeropage
@@ -1101,7 +1106,7 @@ public class Mos6502(in IMemory memory)
             0x4B => instructionTimer switch
             {
                Timing.T2 | Timing.T0 => Timing.T3,
-               Timing.T3 => AlrCycle2(), 
+               Timing.T3 => Alr(), 
                 _ => throw new InvalidInstructionStepException(0x4B)
             },
             // 0x4C JMP abs
@@ -2158,12 +2163,12 @@ public class Mos6502(in IMemory memory)
             // 0xC1 CMP X, ind
             0xC1 => instructionTimer switch
             {
-               Timing.T2 => CmpIndirectXCycle1(),
-               Timing.T3 =>CmpIndirectXCycle2(),
-               Timing.T4 => CmpIndirectXCycle3(),
-               Timing.T5 => CmpIndirectXCycle4(),
-               Timing.T6 =>CmpIndirectXCycle5(),
-               Timing.T0 => CmpIndirectXCycle6(),
+               Timing.T2 => IndirectCycle1(),
+               Timing.T3 => IndirectXCycle2(),
+               Timing.T4 => IndirectXCycle3(),
+               Timing.T5 =>  IndirectXCycle4(),
+               Timing.T6 => IndirectXCycle5(false),
+               Timing.T0 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xC1)
             },       
             // 0xC2 NOP
@@ -2192,9 +2197,9 @@ public class Mos6502(in IMemory memory)
             // 0xC5 CMP zpg
             0xC5 => instructionTimer switch
             {
-               Timing.T2 => CmpZeropageCycle1(),
-               Timing.T3 =>CmpZeropageCycle2(),
-               Timing.T4 => CmpZeropageCycle3(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T0 => ZeropageRead(),
+               Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xC5)
             },       
             // 0xC6 DEC zpg
@@ -2227,8 +2232,8 @@ public class Mos6502(in IMemory memory)
             // 0xC9 CMP imm
             0xC9 => instructionTimer switch
             {
-               Timing.T2 => CmpImmCycle1(),
-               Timing.T3 =>CmpImmCycle2(),
+               Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
+               Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xC9)
             },       
             // 0xCA DEX impl
@@ -2248,8 +2253,8 @@ public class Mos6502(in IMemory memory)
             // 0xCC CPY abs
             0xCC => instructionTimer switch
             {
-               Timing.T2 => CpyAbsoluteCycle1(),
-               Timing.T3 =>CpyAbsoluteCycle2(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
                Timing.T4 => CpyAbsoluteCycle3(),
                Timing.T5 => CpyAbsoluteCycle4(),
                 _ => throw new InvalidInstructionStepException(0xCC)
@@ -2257,10 +2262,10 @@ public class Mos6502(in IMemory memory)
             // 0xCD CMP abs
             0xCD => instructionTimer switch
             {
-               Timing.T2 => CmpAbsoluteCycle1(),
-               Timing.T3 =>CmpAbsoluteCycle2(),
-               Timing.T4 => CmpAbsoluteCycle3(),
-               Timing.T5 => CmpAbsoluteCycle4(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 => ReadDataPointer(),
+               Timing.T5 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xCD)
             },       
             // 0xCE DEC abs
@@ -2297,12 +2302,12 @@ public class Mos6502(in IMemory memory)
             // 0xD1 CMP ind, Y
             0xD1 => instructionTimer switch
             {
-               Timing.T2 => CmpIndirectYCycle1(),
-               Timing.T3 =>CmpIndirectYCycle2(),
-               Timing.T4 => CmpIndirectYCycle3(),
-               Timing.T5 => CmpIndirectYCycle4(),
-               Timing.T6 =>CmpIndirectYCycle5(),
-               Timing.T0 => CmpIndirectYCycle6(),
+                Timing.T2 => IndirectCycle1(),
+                Timing.T3 => IndirectYCycle2(),
+                Timing.T4 => IndirectYCycle3(),
+                Timing.T5 => IndirectYCycle4(),
+                Timing.T0 => IndirectYCycle5(),
+                Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xD1)
             },       
             // 0xD2 Jam
@@ -2332,10 +2337,10 @@ public class Mos6502(in IMemory memory)
             // 0xD5 CMP zpg, X
             0xD5 => instructionTimer switch
             {
-               Timing.T2 => CmpZeropageXCycle1(),
-               Timing.T3 =>CmpZeropageXCycle2(),
-               Timing.T4 => CmpZeropageXCycle3(),
-               Timing.T5 => CmpZeropageXCycle4(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 => ZeropageAddIndexXLow(),
+               Timing.T0 => ZeropageRead(),
+               Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xD5)
             },       
             // 0xD6 DEC zpg, X
@@ -2370,11 +2375,11 @@ public class Mos6502(in IMemory memory)
             // 0xD9 CMP abs, Y
             0xD9 => instructionTimer switch
             {
-               Timing.T2 => CmpAbsoluteYCycle1(),
-               Timing.T3 =>CmpAbsoluteYCycle2(),
-               Timing.T4 => CmpAbsoluteYCycle3(),
-               Timing.T5 => CmpAbsoluteYCycle4(),
-               Timing.T6 =>CmpAbsoluteYCycle5(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteAddIndexYLow(),
+               Timing.T4 => AbsoluteAddIndexYHigh(),
+               Timing.T0 => ReadDataPointer(),
+               Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xD9)
             },       
             // 0xDA NOP impl
@@ -2409,11 +2414,11 @@ public class Mos6502(in IMemory memory)
             // 0xDD CMP abs, X
             0xDD => instructionTimer switch
             {
-               Timing.T2 => CmpAbsoluteXCycle1(),
-               Timing.T3 =>CmpAbsoluteXCycle2(),
-               Timing.T4 => CmpAbsoluteXCycle3(),
-               Timing.T5 => CmpAbsoluteXCycle4(),
-               Timing.T6 =>CmpAbsoluteXCycle5(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteAddIndexXLow(),
+               Timing.T4 => AbsoluteAddIndexXHigh(),
+               Timing.T0 => ReadDataPointer(),
+               Timing.TPlus | Timing.T1 => Cmp(Accumulator),
                 _ => throw new InvalidInstructionStepException(0xDD)
             },
             // 0xDE DEC abs, X
@@ -2468,14 +2473,14 @@ public class Mos6502(in IMemory memory)
             // 0xE3 ISC x, ind
             0xE3 => instructionTimer switch
             {
-               Timing.T2 => IscIndirectXCycle1(),
-               Timing.T3 =>IscIndirectXCycle2(),
-               Timing.T4 => IscIndirectXCycle3(),
-               Timing.T5 => IscIndirectXCycle4(),
-               Timing.T6 =>IscIndirectXCycle5(),
-               Timing.T0 => IscIndirectXCycle6(),
-               Timing.TPlus => IscIndirectXCycle7(),
-               Timing.T8 => IscIndirectXCycle8(),
+               Timing.T2 => IndirectCycle1(),
+               Timing.T3 => IndirectXCycle2(),
+               Timing.T4 => IndirectXCycle3(),
+               Timing.T5 => IndirectXCycle4(),
+               Timing.SD1 => IndirectXCycle5(true),
+               Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xE3)
             },
             // 0xE4 CPX zpg
@@ -2497,21 +2502,21 @@ public class Mos6502(in IMemory memory)
             // 0xE6 INC zpg
             0xE6 => instructionTimer switch
             {
-               Timing.T2 => IncZeropageCycle1(),
-               Timing.T3 =>IncZeropageCycle2(),
-               Timing.T4 => IncZeropageCycle3(),
-               Timing.T5 => IncZeropageCycle4(),
-               Timing.T6 =>IncZeropageCycle5(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 | Timing.SD1 => ZeropageRead(),
+               Timing.T4 | Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xE6)
             },
             // 0xE7 ISC zpg
             0xE7 => instructionTimer switch
             {
-               Timing.T2 => IscZeropageCycle1(),
-               Timing.T3 =>IscZeropageCycle2(),
-               Timing.T4 => IscZeropageCycle3(),
-               Timing.T5 => IscZeropageCycle4(),
-               Timing.T6 =>IscZeropageCycle5(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 | Timing.SD1 => ReadDataPointer(),
+               Timing.T4  | Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xE7)
             },
             // 0xE8 INX impl
@@ -2525,7 +2530,7 @@ public class Mos6502(in IMemory memory)
             0xE9 => instructionTimer switch
             {
                 Timing.T2 | Timing.T0 => Timing.T1 | Timing.TPlus,
-                Timing.TPlus |  Timing.T1 => LogicSubtract(MemoryAddressRegister),
+                Timing.TPlus |  Timing.T1 => LogicSubtract(MemoryDataRegister),
                 _ => throw new InvalidInstructionStepException(0xE9)
             },
             // 0xEA NOP impl
@@ -2548,7 +2553,7 @@ public class Mos6502(in IMemory memory)
                Timing.T2 => AbsoluteCycle1(),
                Timing.T3 => AbsoluteCycle2(Timing.T0),
                Timing.T0 => ReadDataPointer(Timing.T1 | Timing.TPlus),
-               Timing.T1 | Timing.TPlus => LogicCompare(X, MemoryAddressRegister),
+               Timing.T1 | Timing.TPlus => Cmp(X),
                 _ => throw new InvalidInstructionStepException(0xEC)
             },
             // 0xED SBC abs
@@ -2557,7 +2562,7 @@ public class Mos6502(in IMemory memory)
                Timing.T2 => AbsoluteCycle1(),
                Timing.T3 => AbsoluteCycle2(Timing.T0),
                Timing.T0 => ReadDataPointer(Timing.TPlus | Timing.T1),
-               Timing.TPlus | Timing.T1 => LogicSubtract(MemoryAddressRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(MemoryDataRegister),
                 _ => throw new InvalidInstructionStepException(0xED)
             },
             // 0xEE INC abs
@@ -2565,21 +2570,21 @@ public class Mos6502(in IMemory memory)
             {
                Timing.T2 => AbsoluteCycle1(),
                Timing.T3 => AbsoluteCycle2(),
-               Timing.T4 => ReadDataPointer(),
-               Timing.T5 => IncAbsoluteCycle4(),
-               Timing.T6 =>IncAbsoluteCycle5(),
-               Timing.T0 => IncAbsoluteCycle6(),
+               Timing.T4 | Timing.SD1 => ReadDataPointer(),
+               Timing.T5 | Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => Timing.T2,
                 _ => throw new InvalidInstructionStepException(0xEE)
             },
             // 0xEF ISC abs
             0xEF => instructionTimer switch
             {
-               Timing.T2 => IscAbsoluteCycle1(),
-               Timing.T3 =>IscAbsoluteCycle2(),
-               Timing.T4 => IscAbsoluteCycle3(),
-               Timing.T5 => IscAbsoluteCycle4(),
-               Timing.T6 =>IscAbsoluteCycle5(),
-               Timing.T0 => IscAbsoluteCycle6(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteCycle2(),
+               Timing.T4 | Timing.SD1 => ReadDataPointer(),
+               Timing.T5 | Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xEF)
             },
             // 0xF0 BEQ rel
@@ -2607,14 +2612,14 @@ public class Mos6502(in IMemory memory)
             // 0xF3 ISC ind, Y
             0xF3 => instructionTimer switch
             {
-               Timing.T2 => IscIndirectYCycle1(),
-               Timing.T3 =>IscIndirectYCycle2(),
-               Timing.T4 => IscIndirectYCycle3(),
-               Timing.T5 => IscIndirectYCycle4(),
-               Timing.T6 =>IscIndirectYCycle5(),
-               Timing.T0 => IscIndirectYCycle6(),
-               Timing.TPlus => IscIndirectYCycle7(),
-               Timing.T8 => IscIndirectYCycle8(),
+               Timing.T2 => IndirectCycle1(),
+               Timing.T3 => IndirectYCycle2(),
+               Timing.T4 => IndirectYCycle3(),
+               Timing.T5 => IndirectYCycle4(),
+               Timing.SD1 => IndirectYCycle5(),
+               Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xF3)
             },
             // 0xF4 NOP zpg, X
@@ -2649,12 +2654,12 @@ public class Mos6502(in IMemory memory)
             // 0xF7 ISC zpg, X
             0xF7 => instructionTimer switch
             {
-               Timing.T2 => IscZeropageXCycle1(),
-               Timing.T3 =>IscZeropageXCycle2(),
-               Timing.T4 => IscZeropageXCycle3(),
-               Timing.T5 => IscZeropageXCycle4(),
-               Timing.T6 =>IscZeropageXCycle5(),
-               Timing.T0 => IscZeropageXCycle6(),
+               Timing.T2 => ZeropageCycle1(),
+               Timing.T3 => ZeropageAddIndexXLow(),
+               Timing.T4 | Timing.SD1 => ReadDataPointer(),
+               Timing.T5 | Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xF7)
             },
             // 0xF8 SED impl
@@ -2684,13 +2689,13 @@ public class Mos6502(in IMemory memory)
             // 0xFB ISC abs, Y
             0xFB => instructionTimer switch
             {
-               Timing.T2 => IscAbsoluteYCycle1(),
-               Timing.T3 =>IscAbsoluteYCycle2(),
-               Timing.T4 => IscAbsoluteYCycle3(),
-               Timing.T5 => IscAbsoluteYCycle4(),
-               Timing.T6 =>IscAbsoluteYCycle5(),
-               Timing.T0 => IscAbsoluteYCycle6(),
-               Timing.TPlus => IscAbsoluteYCycle7(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteAddIndexYLow(),
+               Timing.T4 => AbsoluteAddIndexYHigh(),
+               Timing.T5 | Timing.SD1 => ReadDataPointer(),
+               Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xFB)
             },
             // 0xFC NOP abs, X
@@ -2726,15 +2731,16 @@ public class Mos6502(in IMemory memory)
                 _ => throw new InvalidInstructionStepException(0xFE)
             },
             // 0xFF ISC abs, X
+            // ReSharper disable once PatternIsRedundant
             0xFF => instructionTimer switch
             {
-               Timing.T2 => IscAbsoluteXCycle1(),
-               Timing.T3 =>IscAbsoluteXCycle2(),
-               Timing.T4 => IscAbsoluteXCycle3(),
-               Timing.T5 => IscAbsoluteXCycle4(),
-               Timing.T6 =>IscAbsoluteXCycle5(),
-               Timing.T0 => IscAbsoluteXCycle6(),
-               Timing.TPlus => IscAbsoluteXCycle7(),
+               Timing.T2 => AbsoluteCycle1(),
+               Timing.T3 => AbsoluteAddIndexXLow(),
+               Timing.T4 => AbsoluteAddIndexXHigh(),
+               Timing.T5 | Timing.SD1 => ReadDataPointer(),
+               Timing.SD2 => Inc(),
+               Timing.T0 => Write(MemoryAddressRegister, TempRegister),
+               Timing.TPlus | Timing.T1 => LogicSubtract(TempRegister),
                 _ => throw new InvalidInstructionStepException(0xFF)
             },
         };
@@ -2876,7 +2882,13 @@ public class Mos6502(in IMemory memory)
         DataPointerLow += X;
         return Timing.T4;
     }
-    
+
+    private Timing RmwDummyWrite()
+    {
+        ReadPin = false;
+        MemoryDataOutputRegister = MemoryDataRegister;
+        return Timing.T0;
+    }
 
     
     /// <summary>
@@ -2889,7 +2901,7 @@ public class Mos6502(in IMemory memory)
     /// C ← 1 if A was odd, otherwise 0
     /// </summary>
     /// <returns><see cref="Timing.T2"/>, this is the last cycle.</returns>
-    private Timing AlrCycle2()
+    private Timing Alr()
     {
         var (result, negative, zero, carry) = AluLogicalShiftRight(Accumulator & MemoryDataRegister);
         Accumulator = result;
@@ -2906,206 +2918,6 @@ public class Mos6502(in IMemory memory)
     }
 
     private Timing SbxCycle1()
-    {
-        return Timing.T1;
-    }
-
-    // isc
-    private Timing IscZeropageCycle5()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscZeropageCycle4()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscZeropageCycle3()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscZeropageCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageCycle1()
-    {
-        return Timing.T1;
-    }
-
-
-    private Timing IscZeropageXCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscZeropageXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscAbsoluteCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscAbsoluteXCycle7()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscAbsoluteYCycle7()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscAbsoluteYCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscIndirectXCycle8()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle7()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing IscIndirectYCycle8()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle7()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing IscIndirectYCycle1()
     {
         return Timing.T1;
     }
@@ -5196,6 +5008,7 @@ public class Mos6502(in IMemory memory)
 
     private Timing Asl()
     {
+        RmwDummyWrite();
         var (result, carry, zero, overflow) = AluAsl(MemoryDataRegister);
         TempRegister = result;
         CarryBit = carry;
@@ -5394,6 +5207,7 @@ public class Mos6502(in IMemory memory)
 
     private Timing Slo()
     {
+        RmwDummyWrite();
         var (result, _, __, ___) = AluAsl(MemoryDataRegister);
         TempRegister = result;
         var (____, zero, negative) = AluOr(Accumulator, result);
@@ -6572,6 +6386,19 @@ public class Mos6502(in IMemory memory)
         NegativeBit = (MemoryDataRegister & 0x80) == 0x80;
         OverflowBit = (MemoryDataRegister & 0x40) == 0x40;
         ZeroBit = (MemoryDataRegister & Accumulator) == 0;
+        return Timing.T2;
+    }
+
+    private Timing Inc()
+    {
+        RmwDummyWrite();
+        TempRegister = (byte)(MemoryDataRegister + 1);
+        return Timing.T0;
+    }
+
+    private Timing Cmp(byte registerValue)
+    {
+        LogicCompare(registerValue, MemoryDataRegister);
         return Timing.T2;
     }
 }
