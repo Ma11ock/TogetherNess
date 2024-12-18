@@ -8,14 +8,6 @@ namespace TogetherNess.Hardware;
 
 public class Mos6502(in IMemory memory)
 {
-    private enum DestinationRegister
-    {
-        IndexX = 1,
-        IndexY = 1 << 1,
-        Accumulator = 1 << 2,
-        StackPointer = 1 << 3,
-    }
-    
     private const Timing FIRST_CYCLE = Timing.T2;
     
     private const Timing TWO_CYCLE_FIRST_TIMING = Timing.T0 | Timing.T2;
@@ -1685,7 +1677,7 @@ public class Mos6502(in IMemory memory)
             0x8A => instructionTimer switch
             {
                 Timing.T2 | Timing.T0 => Timing.TPlus | Timing.T0,
-                Timing.TPlus | Timing.T1 => Transfer(X, DestinationRegister.Accumulator),
+                Timing.TPlus | Timing.T1 => Txa(),
                 _ => throw new InvalidInstructionStepException(0x8A)
             },       
             // 0x8B ANE impl
@@ -1805,7 +1797,7 @@ public class Mos6502(in IMemory memory)
             0x98 => instructionTimer switch
             {
                 Timing.T0 |  Timing.T2 => Timing.TPlus | Timing.T1,
-                Timing.TPlus | Timing.T1 => Transfer(Y, DestinationRegister.Accumulator),
+                Timing.TPlus | Timing.T1 => Tya(),
                 _ => throw new InvalidInstructionStepException(0x98)
             },       
             // 0x99 STA abs, Y
@@ -1822,7 +1814,7 @@ public class Mos6502(in IMemory memory)
             0x9A => instructionTimer switch
             {
                 Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
-                Timing.TPlus | Timing.T1 => Transfer(X, DestinationRegister.StackPointer),
+                Timing.TPlus | Timing.T1 => Txs(),
                 _ => throw new InvalidInstructionStepException(0x9A)
             },       
             // 0x9B TAS abs, Y
@@ -1947,7 +1939,7 @@ public class Mos6502(in IMemory memory)
             0xA8 => instructionTimer switch
             {
                 TWO_CYCLE_FIRST_TIMING => LAST_CYCLE_TIMING,
-                LAST_CYCLE_TIMING => Transfer(Accumulator, DestinationRegister.IndexY),
+                LAST_CYCLE_TIMING => Tay(),
                 _ => throw new InvalidInstructionStepException(0xA8)
             },       
             // 0xA9 LDA imm
@@ -1961,7 +1953,7 @@ public class Mos6502(in IMemory memory)
             0xAA => instructionTimer switch
             {
                 TWO_CYCLE_FIRST_TIMING => LAST_CYCLE_TIMING,
-                LAST_CYCLE_TIMING => Transfer(Accumulator, DestinationRegister.IndexX),
+                LAST_CYCLE_TIMING => Tax(),
                 _ => throw new InvalidInstructionStepException(0xAA)
             },       
             // 0xAB LXA imm
@@ -2097,7 +2089,7 @@ public class Mos6502(in IMemory memory)
             0xBA => instructionTimer switch
             {
                 Timing.T0 | Timing.T2 => Timing.TPlus | Timing.T1,
-                Timing.TPlus | Timing.T1 => Transfer(StackPointer, DestinationRegister.IndexX),
+                Timing.TPlus | Timing.T1 => Tsx(),
                 _ => throw new InvalidInstructionStepException(0xBA)
             },       
             // 0xBB LAS abs, Y
@@ -2924,118 +2916,6 @@ public class Mos6502(in IMemory memory)
         return Timing.T1;
     }
 
-    // lxa
-    private Timing LxaCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LxaCycle1()
-    {
-        return Timing.T1;
-    }
-
-    // lax
-
-    private Timing LaxZeropageCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxZeropageCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxZeropageCycle1()
-    {
-        return Timing.T1;
-    }
-
-
-    private Timing LaxZeropageYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxZeropageYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxZeropageYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxZeropageYCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LaxAbsoluteCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxAbsoluteCycle3()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LaxAbsoluteCycle2()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LaxAbsoluteCycle1()
-    {
-        return Timing.T1;
-    }
-
-
-    private Timing LaxIndirectXCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LaxIndirectYCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectYCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LaxIndirectYCycle1()
-    {
-        return Timing.T1;
-    }
 
     // shx
     private Timing ShxCycle5()
@@ -3323,42 +3203,6 @@ public class Mos6502(in IMemory memory)
         return Timing.T2;
     }
 
-    private Timing Transfer(byte @value, DestinationRegister destinationRegister)
-    {
-        var (result, zero, negative, _, __) = AluAdd(@value, 0, false);
-        switch (destinationRegister)
-        {
-            case DestinationRegister.IndexX:
-                X = result;
-                NegativeBit = negative;
-                ZeroBit = zero;
-                break;
-            case DestinationRegister.IndexY:
-                Y = result;
-                NegativeBit = negative;
-                ZeroBit = zero;
-                break;
-            case DestinationRegister.Accumulator:
-                Accumulator = result;
-                NegativeBit = negative;
-                ZeroBit = zero;
-                break;
-            case DestinationRegister.StackPointer:
-                StackPointer = result;
-                break;
-        }
-        return Timing.T2;
-    }
-    
-    private Timing ClvCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing ClvCycle1()
-    {
-        return Timing.T1;
-    }
-
     private Timing CliCycle2()
     {
         return Timing.T1;
@@ -3571,82 +3415,6 @@ public class Mos6502(in IMemory memory)
         return Timing.T1;
     }
 
-    private Timing LdyImmCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyImmCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdyZeropageCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyZeropageCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyZeropageCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdyZeropageXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyZeropageXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyZeropageXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyZeropageXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdyAbsoluteCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdyAbsoluteXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdyAbsoluteXCycle1()
-    {
-        return Timing.T1;
-    }
 
     private Timing BcsCycle4()
     {
@@ -3882,132 +3650,6 @@ public class Mos6502(in IMemory memory)
         return Timing.T1;
     }
 
-    private Timing LdaZeropageCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaZeropageCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaZeropageCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdaZeropageXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaZeropageXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaZeropageXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaZeropageXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdaAbsoluteCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteCycle1()
-    {
-        return Timing.T1;
-    }
-
-
-    private Timing LdaAbsoluteYCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaAbsoluteYCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdaIndirectXCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectXCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectXCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectXCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectXCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectXCycle1()
-    {
-        return Timing.T1;
-    }
-
-    private Timing LdaIndirectYCycle6()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectYCycle5()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectYCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectYCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectYCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdaIndirectYCycle1()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxImmCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxImmCycle1()
-    {
-        return Timing.T1;
-    }
 
     private Timing LdxZeropageYCycle1()
     {
@@ -4028,38 +3670,6 @@ public class Mos6502(in IMemory memory)
     {
         return Timing.T1;
     }
-
-    private Timing LdxZeropageCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxZeropageCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxZeropageCycle1()
-    {
-        return Timing.T1;
-    }
-
-
-    private Timing LdxAbsoluteCycle4()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxAbsoluteCycle3()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxAbsoluteCycle2()
-    {
-        return Timing.T1;
-    }
-    private Timing LdxAbsoluteCycle1()
-    {
-        return Timing.T1;
-    }
-
 
     private Timing BitZeropageCycle2()
     {
@@ -5539,7 +5149,7 @@ public class Mos6502(in IMemory memory)
         return Timing.T2;
     }
 
-    private void SetStatusAfterLoad(byte value)
+    private void SetNegativeOverflowFromValue(byte value)
     {
         NegativeBit = (value & 0x80) == 0x80;
         ZeroBit = value == 0;
@@ -5548,21 +5158,21 @@ public class Mos6502(in IMemory memory)
     private Timing Lax()
     {
         Accumulator = X = MemoryDataRegister;
-        SetStatusAfterLoad(Accumulator);
+        SetNegativeOverflowFromValue(Accumulator);
         return Timing.T2;
     }
     
     private Timing Ldx()
     {
         X = MemoryDataRegister;
-        SetStatusAfterLoad(X);
+        SetNegativeOverflowFromValue(X);
         return Timing.T2;
     }
     
     private Timing Ldy()
     {
         Y = MemoryDataRegister;
-        SetStatusAfterLoad(Y);
+        SetNegativeOverflowFromValue(Y);
         return Timing.T2;
     }
     
@@ -5576,7 +5186,7 @@ public class Mos6502(in IMemory memory)
     private Timing Lda()
     {
         Accumulator = MemoryDataRegister;
-        SetStatusAfterLoad(Accumulator);
+        SetNegativeOverflowFromValue(Accumulator);
         return Timing.T2;
     }
 
@@ -5589,6 +5199,48 @@ public class Mos6502(in IMemory memory)
     private Timing Lxa()
     {
         // TODO
+        return Timing.T2;
+    }
+
+    private Timing Tax()
+    {
+        X = Accumulator;
+        SetNegativeOverflowFromValue(X);
+        return Timing.T2;
+    }
+    
+    private Timing Tsx()
+    {
+        X = StackPointer;
+        SetNegativeOverflowFromValue(X);
+        return Timing.T2;
+    }
+    
+    private Timing Txa()
+    {
+        Accumulator = X;
+        SetNegativeOverflowFromValue(Accumulator);
+        return Timing.T2;
+    }
+    
+    private Timing Txs()
+    {
+        StackPointer = X;
+        SetNegativeOverflowFromValue(StackPointer);
+        return Timing.T2;
+    }
+    
+    private Timing Tya()
+    {
+        Accumulator = Y;
+        SetNegativeOverflowFromValue(Accumulator);
+        return Timing.T2;
+    }
+    
+    private Timing Tay()
+    {
+        Y = Accumulator;
+        SetNegativeOverflowFromValue(Y);
         return Timing.T2;
     }
 }
